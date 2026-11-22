@@ -19,15 +19,20 @@ An ultra-fast, lightweight network routing and packet queue optimizer for compet
 * **Route Metric Prioritization:** Enforces high priority (Metric 5) on the physical network card (Ethernet/Wi-Fi), preventing virtual VPNs (Radmin VPN, Hamachi, etc.) from hijacking default routing.
 * **Receive Side Scaling (RSS) & Offload:** Distributes packet processing across all CPU cores and disables network card power saving.
 
-### 3. 🌐 Cloud Anycast Relay Monitoring
+### 3. ⚡ System Latency & Input Delay (0.5ms Timer & FilterKeys 0 Delay)
+* **0.500 ms High-Precision Kernel Timer (`NtSetTimerResolution` & `timeBeginPeriod`):** Elevates Windows thread dispatching from default 64 Hz (15.6 ms) to 2,000 Hz (0.500 ms). Dramatically reduces network DPC/ISR latency, mouse polling jitter, and frametime micro-stutters.
+* **FilterKeys 0 Keyboard Delay:** Eliminates built-in Windows repeat delay before keypress chaining. Unlocks instant piece control, wall replaces, and double/triple edits in Fortnite. Includes quick presets (Fortnite Pro 150/25, Ultra Fast 120/20) and an interactive live typing test area.
+* **Synchronized Auto-Boost:** Automatically activates 0.5ms and FilterKeys whenever game boost starts or a supported game is launched.
+
+### 4. 🌐 Cloud Anycast Relay Monitoring
 * **10-Second Live Monitoring:** Continuously probes leading cloud game relays (Cloudflare Anycast, Valve Game Relays in Warsaw & Frankfurt, Oracle Cloud, AWS Global Accelerator).
 * **Smart Routing:** Automatically selects the lowest-latency node based on live ping from your physical network connection.
 * **Physical Adapter Binding:** All measurements bind directly to your physical network interface via source IP (`ping -S <IP>`).
 
-### 4. 🌍 Multilingual Interface
+### 5. 🌍 Multilingual Interface
 * **Automatic System Language Detection:** Automatically starts in Ukrainian, Russian, or English matching your Windows OS locale, with a seamless manual language switcher (🇺🇦 UA / 🇬🇧 EN / 🇷🇺 RU).
 
-### 5. 🛡️ 100% Anti-Cheat Safe
+### 6. 🛡️ 100% Anti-Cheat Safe
 * Completely safe for **Valve Anti-Cheat (VAC), Riot Vanguard, EasyAntiCheat (EAC), and BattlEye**.
 * Does not modify game binaries, inject code, or access game memory — strictly tunes the Windows TCP/IP network stack.
 

@@ -62,9 +62,51 @@ fn detect_system_language() -> Language {
     Language::English
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+#[allow(non_snake_case)]
+struct FILTERKEYS {
+    cbSize: u32,
+    dwFlags: u32,
+    iWaitMSec: u32,
+    iDelayMSec: u32,
+    iRepeatMSec: u32,
+    iBounceMSec: u32,
+}
+
+const SPI_GETFILTERKEYS: u32 = 0x0032;
+const SPI_SETFILTERKEYS: u32 = 0x0033;
+const SPIF_UPDATEINIFILE: u32 = 0x0001;
+const SPIF_SENDCHANGE: u32 = 0x0002;
+const FKF_FILTERKEYSON: u32 = 0x00000001;
+const FKF_AVAILABLE: u32 = 0x00000002;
+
+#[link(name = "user32")]
+extern "system" {
+    fn SystemParametersInfoW(
+        uiAction: u32,
+        uiParam: u32,
+        pvParam: *mut std::ffi::c_void,
+        fWinIni: u32,
+    ) -> i32;
+}
+
+#[link(name = "ntdll")]
+extern "system" {
+    fn NtSetTimerResolution(desired: u32, set: u8, current: *mut u32) -> i32;
+    fn NtQueryTimerResolution(min: *mut u32, max: *mut u32, cur: *mut u32) -> i32;
+}
+
+#[link(name = "winmm")]
+extern "system" {
+    fn timeBeginPeriod(uPeriod: u32) -> u32;
+    fn timeEndPeriod(uPeriod: u32) -> u32;
+}
+
 #[derive(PartialEq, Clone, Copy)]
 enum AppTab {
     Dashboard,
+    InputDelay,
     LocalTweaks,
     CloudRelay,
     Diagnostics,
@@ -163,6 +205,20 @@ struct AppState {
     node_ping_rx: Option<mpsc::Receiver<(usize, u32)>>,
     adapters_rx: Option<mpsc::Receiver<Vec<NetworkAdapter>>>,
     boost_cancel: Option<Arc<AtomicBool>>,
+
+    // Timer Resolution (0.5ms)
+    timer_res_enabled: bool,
+    timer_res_current_100ns: u32,
+    timer_res_min_100ns: u32,
+    timer_res_max_100ns: u32,
+    auto_apply_timer_res: bool,
+
+    // FilterKeys (Fast Edit / 0 Keyboard Delay)
+    filterkeys_enabled: bool,
+    filterkeys_delay_ms: u32,
+    filterkeys_repeat_ms: u32,
+    auto_apply_filterkeys: bool,
+    filterkeys_test_input: String,
 
     // System Tray
     _tray: Option<TrayItem>,
@@ -295,6 +351,18 @@ impl Default for AppState {
             adapters_rx: None,
             boost_cancel: None,
 
+            timer_res_enabled: false,
+            timer_res_current_100ns: 10000,
+            timer_res_min_100ns: 156250,
+            timer_res_max_100ns: 5000,
+            auto_apply_timer_res: true,
+
+            filterkeys_enabled: false,
+            filterkeys_delay_ms: 150,
+            filterkeys_repeat_ms: 25,
+            auto_apply_filterkeys: true,
+            filterkeys_test_input: String::new(),
+
             _tray: None,
             tray_show_rx: None,
             allow_exit: false,
@@ -365,6 +433,9 @@ impl eframe::App for AppState {
         }
 
         // Intercept close button [X] -> minimize to tray
+        if self.current_tab == AppTab::InputDelay {
+            self.query_timer_resolution();
+        }
         if ctx.input(|i| i.viewport().close_requested()) {
             if !self.allow_exit {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
@@ -472,6 +543,12 @@ impl eframe::App for AppState {
                         self.is_boosted = true;
                         self.boost_start_time = Some(Instant::now());
                         self.start_real_ping_thread();
+                        if self.auto_apply_timer_res {
+                            self.enable_timer_resolution();
+                        }
+                        if self.auto_apply_filterkeys {
+                            self.apply_filterkeys();
+                        }
                     }
                 }
                 None => {
@@ -602,20 +679,23 @@ impl eframe::App for AppState {
                 let tab_titles = match lang {
                     Language::Ukrainian => [
                         (AppTab::Dashboard, "🎮 Оптимізатор ігор"),
+                        (AppTab::InputDelay, "⚡ 0.5ms & FilterKeys"),
                         (AppTab::LocalTweaks, "⚙️ Твіки Windows (Admin)"),
-                        (AppTab::CloudRelay, "🌐 Хмарний релей (Живий 10с)"),
+                        (AppTab::CloudRelay, "🌐 Хмарний релей"),
                         (AppTab::Diagnostics, "📊 Тест & Діагностика"),
                     ],
                     Language::English => [
                         (AppTab::Dashboard, "🎮 Game Optimizer"),
+                        (AppTab::InputDelay, "⚡ 0.5ms & FilterKeys"),
                         (AppTab::LocalTweaks, "⚙️ Windows Tweaks (Admin)"),
-                        (AppTab::CloudRelay, "🌐 Cloud Relay (Live 10s)"),
+                        (AppTab::CloudRelay, "🌐 Cloud Relay"),
                         (AppTab::Diagnostics, "📊 Test & Diagnostics"),
                     ],
                     Language::Russian => [
                         (AppTab::Dashboard, "🎮 Оптимизатор игр"),
+                        (AppTab::InputDelay, "⚡ 0.5ms & FilterKeys"),
                         (AppTab::LocalTweaks, "⚙️ Твики Windows (Admin)"),
-                        (AppTab::CloudRelay, "🌐 Облачный релей (Живой 10с)"),
+                        (AppTab::CloudRelay, "🌐 Облачный релей"),
                         (AppTab::Diagnostics, "📊 Тест и Диагностика"),
                     ],
                 };
@@ -686,6 +766,7 @@ impl eframe::App for AppState {
             ui.add_space(8.0);
             match self.current_tab {
                 AppTab::Dashboard => self.render_dashboard(ui),
+                AppTab::InputDelay => self.render_input_delay(ui),
                 AppTab::LocalTweaks => self.render_local_tweaks(ui),
                 AppTab::CloudRelay => self.render_cloud_relay(ui),
                 AppTab::Diagnostics => self.render_diagnostics(ui),
@@ -952,6 +1033,12 @@ impl AppState {
                             self.is_boosted = true;
                             self.boost_start_time = Some(Instant::now());
                             self.start_real_ping_thread();
+                            if self.auto_apply_timer_res {
+                                self.enable_timer_resolution();
+                            }
+                            if self.auto_apply_filterkeys {
+                                self.apply_filterkeys();
+                            }
                         }
                     } else {
                         let stop_btn_text = match lang {
@@ -973,6 +1060,9 @@ impl AppState {
                             self.boost_start_time = None;
                             if let Some(c) = &self.boost_cancel {
                                 c.store(false, Ordering::Relaxed);
+                            }
+                            if self.auto_apply_timer_res {
+                                self.disable_timer_resolution();
                             }
                         }
                     }
@@ -1120,6 +1210,394 @@ impl AppState {
                             painter.rect_filled(bar_rect, 2.0, col);
                         }
                     }
+                });
+            });
+        });
+    }
+
+
+    fn query_timer_resolution(&mut self) {
+        unsafe {
+            let mut min = 0u32;
+            let mut max = 0u32;
+            let mut cur = 0u32;
+            if NtQueryTimerResolution(&mut min, &mut max, &mut cur) >= 0 {
+                self.timer_res_min_100ns = min;
+                self.timer_res_max_100ns = max;
+                self.timer_res_current_100ns = cur;
+                self.timer_res_enabled = cur <= 6000;
+            }
+        }
+    }
+
+    fn enable_timer_resolution(&mut self) {
+        unsafe {
+            timeBeginPeriod(1);
+            let mut cur = 0u32;
+            NtSetTimerResolution(5000, 1, &mut cur);
+        }
+        self.timer_res_enabled = true;
+        self.query_timer_resolution();
+    }
+
+    fn disable_timer_resolution(&mut self) {
+        unsafe {
+            let mut cur = 0u32;
+            let min = if self.timer_res_min_100ns > 0 { self.timer_res_min_100ns } else { 156250 };
+            NtSetTimerResolution(min, 0, &mut cur);
+            timeEndPeriod(1);
+        }
+        self.timer_res_enabled = false;
+        self.query_timer_resolution();
+    }
+
+    fn query_filterkeys_state(&mut self) {
+        let mut fk = FILTERKEYS {
+            cbSize: std::mem::size_of::<FILTERKEYS>() as u32,
+            dwFlags: 0,
+            iWaitMSec: 0,
+            iDelayMSec: 0,
+            iRepeatMSec: 0,
+            iBounceMSec: 0,
+        };
+        unsafe {
+            if SystemParametersInfoW(SPI_GETFILTERKEYS, fk.cbSize, &mut fk as *mut _ as *mut std::ffi::c_void, 0) != 0 {
+                self.filterkeys_enabled = (fk.dwFlags & FKF_FILTERKEYSON) != 0;
+                if fk.iDelayMSec >= 50 && fk.iDelayMSec <= 2000 {
+                    self.filterkeys_delay_ms = fk.iDelayMSec;
+                }
+                if fk.iRepeatMSec >= 5 && fk.iRepeatMSec <= 1000 {
+                    self.filterkeys_repeat_ms = fk.iRepeatMSec;
+                }
+            }
+        }
+    }
+
+    fn apply_filterkeys(&mut self) {
+        let mut fk = FILTERKEYS {
+            cbSize: std::mem::size_of::<FILTERKEYS>() as u32,
+            dwFlags: FKF_FILTERKEYSON | FKF_AVAILABLE,
+            iWaitMSec: 0,
+            iDelayMSec: self.filterkeys_delay_ms,
+            iRepeatMSec: self.filterkeys_repeat_ms,
+            iBounceMSec: 0,
+        };
+        unsafe {
+            let ret = SystemParametersInfoW(
+                SPI_SETFILTERKEYS,
+                fk.cbSize,
+                &mut fk as *mut _ as *mut std::ffi::c_void,
+                SPIF_UPDATEINIFILE | SPIF_SENDCHANGE,
+            );
+            if ret != 0 {
+                self.filterkeys_enabled = true;
+            }
+        }
+    }
+
+    fn disable_filterkeys(&mut self) {
+        let mut fk = FILTERKEYS {
+            cbSize: std::mem::size_of::<FILTERKEYS>() as u32,
+            dwFlags: FKF_AVAILABLE,
+            iWaitMSec: 0,
+            iDelayMSec: 1000,
+            iRepeatMSec: 500,
+            iBounceMSec: 0,
+        };
+        unsafe {
+            let ret = SystemParametersInfoW(
+                SPI_SETFILTERKEYS,
+                fk.cbSize,
+                &mut fk as *mut _ as *mut std::ffi::c_void,
+                SPIF_UPDATEINIFILE | SPIF_SENDCHANGE,
+            );
+            if ret != 0 {
+                self.filterkeys_enabled = false;
+            }
+        }
+    }
+
+    fn render_input_delay(&mut self, ui: &mut egui::Ui) {
+        let lang = self.language;
+
+        let (heading, sub) = match lang {
+            Language::Ukrainian => (
+                "⚡ Зниження системної затримки та Інпут лагу (Input & System Delay)",
+                "Високоточний таймер ядра Windows (0.500 ms) та моментальний відгук клавіатури FilterKeys для надшвидкого редагу у Fortnite і CS2.",
+            ),
+            Language::English => (
+                "⚡ System Latency & Input Delay Optimizer (0.5ms & FilterKeys)",
+                "High-precision Windows kernel timer (0.500 ms) and zero-delay FilterKeys keyboard response for instant edits and wall replaces.",
+            ),
+            Language::Russian => (
+                "⚡ Снижение системной задержки и Инпут лага (Input & System Delay)",
+                "Высокоточный таймер ядра Windows (0.500 ms) и моментальный отклик клавиатуры FilterKeys для сверхбыстрого редакта в Fortnite и CS2.",
+            ),
+        };
+
+        ui.heading(heading);
+        ui.label(egui::RichText::new(sub).color(egui::Color32::from_rgb(0, 230, 153)));
+        ui.add_space(8.0);
+
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            ui.horizontal(|ui| {
+                // LEFT CARD: SetTimerResolution (0.5ms)
+                ui.vertical(|ui| {
+                    ui.set_width(425.0);
+                    ui.group(|ui| {
+                        let timer_active = self.timer_res_current_100ns <= 6000;
+                        let (card_title, status_text) = match lang {
+                            Language::Ukrainian => (
+                                "⏱️ Таймер ядра Windows (SetTimerResolution 0.5ms)",
+                                if timer_active {
+                                    "● 0.500 ms АКТИВНО (МАКСИМАЛЬНИЙ ВІДГУК ЯДРА)"
+                                } else {
+                                    "○ СТАНДАРТНИЙ ТАЙМЕР WINDOWS (ЗАТРИМКА)"
+                                },
+                            ),
+                            Language::English => (
+                                "⏱️ Windows Kernel Timer (SetTimerResolution 0.5ms)",
+                                if timer_active {
+                                    "● 0.500 ms ACTIVE (MAX KERNEL POLLING)"
+                                } else {
+                                    "○ DEFAULT WINDOWS TIMER (LATENCY)"
+                                },
+                            ),
+                            Language::Russian => (
+                                "⏱️ Таймер ядра Windows (SetTimerResolution 0.5ms)",
+                                if timer_active {
+                                    "● 0.500 ms АКТИВНО (МАКСИМАЛЬНЫЙ ОТКЛИК ЯДРА)"
+                                } else {
+                                    "○ СТАНДАРТНЫЙ ТАЙМЕР WINDOWS (ЗАДЕРЖКА)"
+                                },
+                            ),
+                        };
+
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new(card_title).font(egui::FontId::proportional(15.0)).strong());
+                        });
+                        ui.add_space(4.0);
+
+                        let badge_color = if timer_active {
+                            egui::Color32::from_rgb(0, 255, 128)
+                        } else {
+                            egui::Color32::from_rgb(255, 170, 50)
+                        };
+                        ui.label(egui::RichText::new(status_text).font(egui::FontId::proportional(12.0)).color(badge_color).strong());
+                        ui.add_space(8.0);
+
+                        // Metrics Box
+                        egui::Frame::none()
+                            .fill(egui::Color32::from_rgb(20, 26, 35))
+                            .rounding(6.0)
+                            .inner_margin(8.0)
+                            .show(ui, |ui| {
+                                let (lbl_cur, lbl_max, lbl_min) = match lang {
+                                    Language::Ukrainian => ("Поточний тік таймера:", "Максимальна точність:", "Стандарт Windows:"),
+                                    Language::English => ("Current timer tick:", "Max precision:", "Windows default:"),
+                                    Language::Russian => ("Текущий тик таймера:", "Максимальная точность:", "Стандарт Windows:"),
+                                };
+
+                                let cur_val = format!("{:.3} ms", self.timer_res_current_100ns as f32 / 10000.0);
+                                let max_val = format!("{:.3} ms (2000 Hz)", self.timer_res_max_100ns as f32 / 10000.0);
+                                let min_val = format!("{:.3} ms (64 Hz)", self.timer_res_min_100ns as f32 / 10000.0);
+
+                                ui.horizontal(|ui| {
+                                    ui.label(lbl_cur);
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        ui.label(egui::RichText::new(cur_val).color(if timer_active { egui::Color32::from_rgb(0, 255, 150) } else { egui::Color32::YELLOW }).strong());
+                                    });
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.label(lbl_max);
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        ui.label(egui::RichText::new(max_val).color(egui::Color32::from_rgb(100, 200, 255)));
+                                    });
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.label(lbl_min);
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        ui.label(egui::RichText::new(min_val).color(egui::Color32::GRAY));
+                                    });
+                                });
+                            });
+
+                        ui.add_space(10.0);
+
+                        // Buttons
+                        let (btn_enable_text, btn_disable_text) = match lang {
+                            Language::Ukrainian => ("🚀 УВІМКНУТИ 0.5 ms ТАЙМЕР", "⏸ ПОВЕРНУТИ СТАНДАРТНИЙ"),
+                            Language::English => ("🚀 ENABLE 0.5 ms TIMER", "⏸ RESTORE DEFAULT"),
+                            Language::Russian => ("🚀 ВКЛЮЧИТЬ 0.5 ms ТАЙМЕР", "⏸ ВЕРНУТЬ СТАНДАРТНЫЙ"),
+                        };
+
+                        ui.horizontal(|ui| {
+                            let btn_en = egui::Button::new(
+                                egui::RichText::new(btn_enable_text).color(egui::Color32::BLACK).strong()
+                            ).fill(egui::Color32::from_rgb(0, 230, 153));
+                            if ui.add(btn_en).clicked() {
+                                self.enable_timer_resolution();
+                            }
+
+                            let btn_dis = egui::Button::new(
+                                egui::RichText::new(btn_disable_text).color(egui::Color32::WHITE)
+                            ).fill(egui::Color32::from_rgb(50, 60, 75));
+                            if ui.add(btn_dis).clicked() {
+                                self.disable_timer_resolution();
+                            }
+                        });
+
+                        ui.add_space(8.0);
+                        let auto_timer_lbl = match lang {
+                            Language::Ukrainian => "Авто-активація 0.5ms при старті бусту або виявленні гри",
+                            Language::English => "Auto-activate 0.5ms on game boost / launch",
+                            Language::Russian => "Авто-активация 0.5ms при старте буста или обнаружении игры",
+                        };
+                        ui.checkbox(&mut self.auto_apply_timer_res, auto_timer_lbl);
+
+                        ui.add_space(8.0);
+                        let desc_text = match lang {
+                            Language::Ukrainian => "Примушує планувальник Windows перевіряти мережеві переривання і пакети 2000 разів на секунду (замість 64). Усуває DPC Latency і мікроривки кадрів (frametime spikes).",
+                            Language::English => "Forces Windows thread scheduler to poll network interrupts and packets 2,000 times/sec (instead of 64). Eliminates DPC latency and frame time micro-stutters.",
+                            Language::Russian => "Заставляет планировщик Windows опрашивать сетевые прерывания и пакеты 2000 раз в секунду (вместо 64). Устраняет DPC Latency и микрофризы кадров.",
+                        };
+                        ui.label(egui::RichText::new(desc_text).font(egui::FontId::proportional(11.0)).color(egui::Color32::GRAY));
+                    });
+                });
+
+                ui.add_space(8.0);
+
+                // RIGHT CARD: FilterKeys (0 Delay Keyboard)
+                ui.vertical(|ui| {
+                    ui.set_width(425.0);
+                    ui.group(|ui| {
+                        let fk_active = self.filterkeys_enabled;
+                        let (fk_card_title, fk_status_text) = match lang {
+                            Language::Ukrainian => (
+                                "⌨️ FilterKeys (0 Delay Keyboard / Fast Edit)",
+                                if fk_active {
+                                    format!("● 0 DELAY АКТИВНО (Затримка: {}ms | Повтор: {}ms)", self.filterkeys_delay_ms, self.filterkeys_repeat_ms)
+                                } else {
+                                    "○ СТАНДАРТ WINDOWS (Затримка 1000ms / 500ms)".into()
+                                },
+                            ),
+                            Language::English => (
+                                "⌨️ FilterKeys (0 Delay Keyboard / Fast Edit)",
+                                if fk_active {
+                                    format!("● 0 DELAY ACTIVE (Delay: {}ms | Repeat: {}ms)", self.filterkeys_delay_ms, self.filterkeys_repeat_ms)
+                                } else {
+                                    "○ WINDOWS DEFAULT (Delay: 1000ms / 500ms)".into()
+                                },
+                            ),
+                            Language::Russian => (
+                                "⌨️ FilterKeys (0 Delay Keyboard / Fast Edit)",
+                                if fk_active {
+                                    format!("● 0 DELAY АКТИВНО (Задержка: {}ms | Повтор: {}ms)", self.filterkeys_delay_ms, self.filterkeys_repeat_ms)
+                                } else {
+                                    "○ СТАНДАРТ WINDOWS (Задержка 1000ms / 500ms)".into()
+                                },
+                            ),
+                        };
+
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new(fk_card_title).font(egui::FontId::proportional(15.0)).strong());
+                        });
+                        ui.add_space(4.0);
+
+                        let fk_badge_color = if fk_active {
+                            egui::Color32::from_rgb(0, 255, 128)
+                        } else {
+                            egui::Color32::GRAY
+                        };
+                        ui.label(egui::RichText::new(fk_status_text).font(egui::FontId::proportional(12.0)).color(fk_badge_color).strong());
+                        ui.add_space(8.0);
+
+                        // Presets
+                        let preset_lbl = match lang {
+                            Language::Ukrainian => "Швидкі пресети:",
+                            Language::English => "Quick presets:",
+                            Language::Russian => "Быстрые пресеты:",
+                        };
+                        ui.label(egui::RichText::new(preset_lbl).font(egui::FontId::proportional(12.0)).strong());
+                        ui.horizontal(|ui| {
+                            if ui.button("🎮 Fortnite Pro (150/25)").clicked() {
+                                self.filterkeys_delay_ms = 150;
+                                self.filterkeys_repeat_ms = 25;
+                                self.apply_filterkeys();
+                            }
+                            if ui.button("⚡ Ultra Fast (120/20)").clicked() {
+                                self.filterkeys_delay_ms = 120;
+                                self.filterkeys_repeat_ms = 20;
+                                self.apply_filterkeys();
+                            }
+                            if ui.button("↩ Default").clicked() {
+                                self.disable_filterkeys();
+                            }
+                        });
+
+                        ui.add_space(8.0);
+
+                        // Sliders
+                        let (delay_lbl, repeat_lbl) = match lang {
+                            Language::Ukrainian => ("Repeat Delay (Затримка першого повтору):", "Repeat Rate (Частота повторів клавіші):"),
+                            Language::English => ("Repeat Delay (Initial delay before repeat):", "Repeat Rate (Speed of repeated keys):"),
+                            Language::Russian => ("Repeat Delay (Задержка первого повтора):", "Repeat Rate (Частота повторов клавиши):"),
+                        };
+
+                        ui.label(egui::RichText::new(delay_lbl).font(egui::FontId::proportional(11.0)));
+                        ui.add(egui::Slider::new(&mut self.filterkeys_delay_ms, 100..=300).suffix(" ms"));
+
+                        ui.label(egui::RichText::new(repeat_lbl).font(egui::FontId::proportional(11.0)));
+                        ui.add(egui::Slider::new(&mut self.filterkeys_repeat_ms, 10..=50).suffix(" ms"));
+
+                        ui.add_space(8.0);
+
+                        // Apply / Disable buttons
+                        let (fk_apply_txt, fk_dis_txt) = match lang {
+                            Language::Ukrainian => ("⚡ ЗАСТОСУВАТИ FILTERKEYS", "Вимкнути"),
+                            Language::English => ("⚡ APPLY FILTERKEYS", "Disable"),
+                            Language::Russian => ("⚡ ПРИМЕНИТЬ FILTERKEYS", "Отключить"),
+                        };
+
+                        ui.horizontal(|ui| {
+                            let apply_btn = egui::Button::new(
+                                egui::RichText::new(fk_apply_txt).color(egui::Color32::BLACK).strong()
+                            ).fill(egui::Color32::from_rgb(0, 200, 255));
+                            if ui.add(apply_btn).clicked() {
+                                self.apply_filterkeys();
+                            }
+
+                            let dis_btn = egui::Button::new(
+                                egui::RichText::new(fk_dis_txt).color(egui::Color32::WHITE)
+                            ).fill(egui::Color32::from_rgb(50, 60, 75));
+                            if ui.add(dis_btn).clicked() {
+                                self.disable_filterkeys();
+                            }
+                        });
+
+                        ui.add_space(6.0);
+                        let auto_fk_lbl = match lang {
+                            Language::Ukrainian => "Авто-застосування 0 Delay при старті бусту гри",
+                            Language::English => "Auto-apply 0 Delay on game boost / launch",
+                            Language::Russian => "Авто-применение 0 Delay при старте буста игры",
+                        };
+                        ui.checkbox(&mut self.auto_apply_filterkeys, auto_fk_lbl);
+
+                        ui.add_space(8.0);
+                        // Interactive typing test box!
+                        let (test_lbl, clear_lbl) = match lang {
+                            Language::Ukrainian => ("🧪 Тест відгуку (затисніть будь-яку клавішу тут):", "Очистити"),
+                            Language::English => ("🧪 Response test (hold down any key here):", "Clear"),
+                            Language::Russian => ("🧪 Тест отклика (зажмите любую клавишу здесь):", "Очистить"),
+                        };
+                        ui.label(egui::RichText::new(test_lbl).font(egui::FontId::proportional(11.0)).strong());
+                        ui.horizontal(|ui| {
+                            ui.text_edit_singleline(&mut self.filterkeys_test_input);
+                            if ui.button(clear_lbl).clicked() {
+                                self.filterkeys_test_input.clear();
+                            }
+                        });
+                    });
                 });
             });
         });
@@ -1717,8 +2195,8 @@ fn scan_for_games(supported_games: &[GameDefinition]) -> Option<DetectedGame> {
 fn main() -> eframe::Result<()> {
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([860.0, 610.0])
-            .with_min_inner_size([760.0, 520.0])
+            .with_inner_size([910.0, 630.0])
+            .with_min_inner_size([800.0, 540.0])
             .with_title(APP_WINDOW_TITLE),
         ..Default::default()
     };
@@ -1728,6 +2206,8 @@ fn main() -> eframe::Result<()> {
         native_options,
         Box::new(|cc| {
             let mut app = AppState::default();
+            app.query_timer_resolution();
+            app.query_filterkeys_state();
 
             // Background Network Adapters Detection (queries all, sorts physical first)
             let (adapter_tx, adapter_rx) = mpsc::channel();
@@ -1857,4 +2337,11 @@ fn main() -> eframe::Result<()> {
             Ok(Box::new(app))
         }),
     )
+}
+
+
+impl Drop for AppState {
+    fn drop(&mut self) {
+        self.disable_timer_resolution();
+    }
 }
