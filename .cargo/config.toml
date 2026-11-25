@@ -1,5 +1,7 @@
 [build]
 rustflags = [
+    "--remap-path-prefix=C:\\Users\\Vsqy\\Desktop\\WPing=.",
+    "--remap-path-prefix=C:\\Users\\Vsqy\\.cargo\\registry\\src=crates",
     "--remap-path-prefix=C:\\Users\\Vsqy=~",
     "--remap-path-prefix=C:/Users/Vsqy=~"
 ]
