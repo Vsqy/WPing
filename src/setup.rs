@@ -123,16 +123,16 @@ impl eframe::App for SetupApp {
             // Title
             ui.horizontal(|ui| {
                 ui.label(
-                    egui::RichText::new("⚡ WPING SETUP")
+                    egui::RichText::new("⚡ WPING v2.0 SETUP")
                         .font(egui::FontId::proportional(22.0))
                         .color(egui::Color32::from_rgb(0, 230, 153))
                         .strong(),
                 );
 
                 let sub_title = match lang {
-                    Language::Ukrainian => "Встановлення та оптимізація під ПК",
-                    Language::English => "Installation & PC Tuning",
-                    Language::Russian => "Установка и оптимизация под ПК",
+                    Language::Ukrainian => "Оптимізатор пінгу, FPS, 0.5ms & Інпут лагу",
+                    Language::English => "Ping, FPS, 0.5ms Timer & Input Delay Setup",
+                    Language::Russian => "Оптимизатор пинга, FPS, 0.5ms и Инпут лага",
                 };
                 ui.label(
                     egui::RichText::new(sub_title)
@@ -153,7 +153,7 @@ impl eframe::App for SetupApp {
             });
 
             ui.label(
-                egui::RichText::new("Game Latency & Route Optimizer • Created by Vsqy")
+                egui::RichText::new("Ultimate Latency, Ping & FPS Optimizer • Created by Vsqy")
                     .font(egui::FontId::proportional(11.0))
                     .color(egui::Color32::from_rgb(0, 200, 255)),
             );
@@ -183,25 +183,25 @@ impl eframe::App for SetupApp {
 
                 let (chk_adapt, chk_tweaks, chk_desk, chk_start, chk_launch) = match lang {
                     Language::Ukrainian => (
-                        "Адаптувати налаштування мережі під конфігурацію ПК",
-                        "Застосувати твіки Windows (TCP_NODELAY & Throttling)",
+                        "Адаптувати мережеву карту під цей ПК (InterruptMod=Off, Metric=5)",
+                        "Застосувати твіки Windows (Nagle, QoS, GameDVR FPS & Win11 0.5ms)",
                         "Створити ярлик на Робочому столі",
                         "Додати ярлик у меню 'Пуск'",
-                        "Запустити WPing після завершення",
+                        "Запустити WPing v2.0 після завершення",
                     ),
                     Language::English => (
-                        "Tune and optimize network settings for this PC",
-                        "Apply Windows tweaks (TCP_NODELAY & Throttling)",
+                        "Tune PC network adapter hardware (InterruptMod=Off, Metric=5)",
+                        "Apply Windows tweaks (Nagle, QoS, GameDVR FPS & Win11 0.5ms)",
                         "Create Desktop shortcut",
                         "Add Start Menu shortcut",
-                        "Launch WPing after installation",
+                        "Launch WPing v2.0 after installation",
                     ),
                     Language::Russian => (
-                        "Адаптировать настройки сети под конфигурацию ПК",
-                        "Применить твики Windows (TCP_NODELAY & Throttling)",
+                        "Адаптировать сетевую карту под этот ПК (InterruptMod=Off, Metric=5)",
+                        "Применить твики Windows (Nagle, QoS, GameDVR FPS и Win11 0.5ms)",
                         "Создать ярлык на Рабочем столе",
                         "Добавить ярлык в меню 'Пуск'",
-                        "Запустить WPing после завершения",
+                        "Запустить WPing v2.0 после завершения",
                     ),
                 };
 

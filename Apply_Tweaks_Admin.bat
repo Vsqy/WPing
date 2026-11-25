@@ -29,20 +29,22 @@ if '%errorlevel%' NEQ '0' (
 :--------------------------------------
 
 echo ========================================================
-echo   WPing - Applying Real Windows Latency Optimization
+echo   WPing v2.0 - Ultimate Ping, FPS ^& Kernel Optimizer
 echo   Created by Vsqy
 echo ========================================================
 echo.
 
-echo [*] 1. Disabling Network Throttling & Multimedia Latency...
+echo [*] 1. Disabling Network Throttling, Reserved Bandwidth ^& Tuning MMCSS...
 reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile" /v NetworkThrottlingIndex /t REG_DWORD /d 0xffffffff /f >nul
 reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile" /v SystemResponsiveness /t REG_DWORD /d 0 /f >nul
 reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile\Tasks\Games" /v "GPU Priority" /t REG_DWORD /d 8 /f >nul
 reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile\Tasks\Games" /v "Priority" /t REG_DWORD /d 6 /f >nul
 reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile\Tasks\Games" /v "Scheduling Category" /t REG_SZ /d "High" /f >nul
 reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile\Tasks\Games" /v "SFIO Priority" /t REG_SZ /d "High" /f >nul
+reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile\Tasks\Games" /v "Latency Sensitive" /t REG_SZ /d "True" /f >nul
+reg add "HKLM\SOFTWARE\Policies\Microsoft\Windows\Psched" /v NonBestEffortLimit /t REG_DWORD /d 0 /f >nul
 
-echo [*] 2. Disabling Nagle's Algorithm (TCP_NODELAY & Instant ACK) on all adapters...
+echo [*] 2. Disabling Nagle's Algorithm (TCP_NODELAY ^& Instant ACK)...
 powershell -NoProfile -Command "
 $interfaces = Get-ChildItem 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces';
 foreach ($iface in $interfaces) {
@@ -52,21 +54,24 @@ foreach ($iface in $interfaces) {
 }
 "
 
-echo [*] 3. Optimizing TCP Global Parameters & RSS...
+echo [*] 3. Optimizing Global TCP Stack ^& NIC Hardware Driver (InterruptModeration=Off)...
 netsh int tcp set global autotuninglevel=normal >nul
 netsh int tcp set global rss=enabled >nul
 netsh int tcp set heuristics disabled >nul
+netsh int tcp set global ecncapability=disabled >nul
 netsh int ip set global taskoffload=enabled >nul
-
-echo [*] 4. Disabling Energy Saving & Tuning Physical Network Cards...
 powershell -NoProfile -Command "
 Get-NetAdapter | Where-Object { $_.Status -eq 'Up' -and $_.Virtual -eq $false } | ForEach-Object {
     Enable-NetAdapterRss -Name $_.Name -ErrorAction SilentlyContinue;
     Disable-NetAdapterPowerManagement -Name $_.Name -ErrorAction SilentlyContinue;
+    Set-NetAdapterAdvancedProperty -Name $_.Name -RegistryKeyword '*InterruptModeration' -RegistryValue 0 -ErrorAction SilentlyContinue;
+    Set-NetAdapterAdvancedProperty -Name $_.Name -RegistryKeyword '*EEE' -RegistryValue 0 -ErrorAction SilentlyContinue;
+    Set-NetAdapterAdvancedProperty -Name $_.Name -RegistryKeyword 'GreenEthernet' -RegistryValue 0 -ErrorAction SilentlyContinue;
+    Set-NetAdapterAdvancedProperty -Name $_.Name -RegistryKeyword '*FlowControl' -RegistryValue 0 -ErrorAction SilentlyContinue;
 }
 "
 
-echo [*] 5. Prioritizing Physical Adapter Route Metric (Preventing VPN hijacking)...
+echo [*] 4. Prioritizing Physical Adapter Route Metric (Preventing VPN hijacking)...
 powershell -NoProfile -Command "
 $chosen = '%~1';
 if ($chosen -and (Get-NetAdapter -Name $chosen -ErrorAction SilentlyContinue)) {
@@ -81,11 +86,20 @@ Get-NetAdapter | Where-Object { $_.Virtual -eq $true -or $_.InterfaceDescription
 }
 "
 
+echo [*] 5. Applying FPS, GPU HAGS, PowerThrottling ^& Win11 0.5ms Global Timer Tweaks...
+reg add "HKCU\System\GameConfigStore" /v GameDVR_Enabled /t REG_DWORD /d 0 /f >nul
+reg add "HKCU\System\GameConfigStore" /v GameDVR_FSEBehaviorMode /t REG_DWORD /d 2 /f >nul
+reg add "HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\GameDVR" /v AppCaptureEnabled /t REG_DWORD /d 0 /f >nul
+reg add "HKLM\SOFTWARE\Policies\Microsoft\Windows\GameDVR" /v AllowGameDVR /t REG_DWORD /d 0 /f >nul
+reg add "HKLM\SYSTEM\CurrentControlSet\Control\Power\PowerThrottling" /v PowerThrottlingOff /t REG_DWORD /d 1 /f >nul
+reg add "HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers" /v HwSchMode /t REG_DWORD /d 2 /f >nul
+reg add "HKLM\SYSTEM\CurrentControlSet\Control\PriorityControl" /v Win32PrioritySeparation /t REG_DWORD /d 38 /f >nul
+reg add "HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\kernel" /v GlobalTimerResolutionRequests /t REG_DWORD /d 1 /f >nul
+
 echo.
 echo ========================================================
-echo   [SUCCESS] Windows Network Stack is now Optimized!
-echo   Physical network card given primary routing priority.
-echo   All packet delays and buffering have been eliminated.
+echo   [SUCCESS] WPing v2.0 System Optimization Complete!
+echo   Network, NIC Hardware, QoS, GameDVR ^& Timers Tuned.
 echo ========================================================
 echo.
 pause
