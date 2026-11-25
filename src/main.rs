@@ -5,9 +5,11 @@ mod sys_native;
 
 use eframe::egui;
 use net_tweaks::{
-    apply_dns_server, apply_mtu_to_adapter, apply_selected_tweaks, default_dns_presets,
-    query_network_adapters, reset_dns_dhcp, rollback_default_tweaks, DnsPreset, NetworkAdapter,
-    TweakOptions,
+    apply_dns_server, apply_max_ping_fix, apply_mtu_to_adapter, apply_region_lock,
+    apply_selected_tweaks, audit_network_health, clear_region_lock, default_dns_presets,
+    fallback_valve_regions, fetch_valve_regions_live, query_network_adapters, reset_dns_dhcp,
+    rollback_default_tweaks, DnsPreset, NetworkAdapter, NetworkHealthReport, TweakOptions,
+    ValveRegion,
 };
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
@@ -17,14 +19,15 @@ use std::time::{Duration, Instant};
 use sys_native::{
     activate_power_plan, activate_ultimate_or_high_perf, apply_filterkeys,
     balance_processes_for_gaming, clean_ram_and_standby, disable_05ms_timer, disable_filterkeys,
-    discover_optimal_mtu, enable_05ms_timer, get_active_power_plan, is_mouse_accel_enabled,
-    is_user_admin, native_icmp_ping, query_filterkeys, query_memory_stats,
+    discover_optimal_mtu, enable_05ms_timer, flush_dns_and_arp_cache, get_active_power_plan,
+    is_mouse_accel_enabled, is_user_admin, native_icmp_ping, query_filterkeys, query_memory_stats,
     query_timer_resolution, resolve_ipv4, restart_as_admin, restore_balanced_processes,
-    scan_for_games, set_mouse_accel, DetectedGame, GameDefinition, IcmpProber, MemoryStats,
+    scan_for_games, set_mouse_accel, set_wifi_scan_enabled, DetectedGame, GameDefinition,
+    IcmpProber, MemoryStats,
 };
 use tray_item::{IconSource, TrayItem};
 
-const APP_WINDOW_TITLE: &str = "WPing v2.0 - Ultimate Latency, Ping & FPS Optimizer";
+const APP_WINDOW_TITLE: &str = "WPing v2.1 - Ultimate Ping, FPS & Input Optimizer";
 static MAIN_HWND: AtomicIsize = AtomicIsize::new(0);
 
 #[derive(PartialEq, Clone, Copy, Debug)]
@@ -129,10 +132,17 @@ struct AppState {
     auto_apply_power_plan: bool,
     auto_clean_ram: bool,
     auto_throttle_bg_procs: bool,
+    auto_wifi_antiscan: bool,
+    wifi_scan_disabled_adapter: Option<String>,
     saved_power_plan_guid: Option<String>,
     active_power_plan_name: String,
     adjusted_bg_pids: Vec<(u32, u32)>,
     last_ram_clean: Option<Instant>,
+
+    // Live Network Bottleneck Scanner
+    health: NetworkHealthReport,
+    health_busy: bool,
+    health_rx: Option<mpsc::Receiver<NetworkHealthReport>>,
 
     // Tweaks Options & Logs
     tweak_opts: TweakOptions,
@@ -152,7 +162,13 @@ struct AppState {
     is_probing_mtu: bool,
     mtu_rx: Option<mpsc::Receiver<(Option<u16>, String)>>,
 
-    // Cloud Relays (8 nodes probed natively every 10s)
+    // Valve CS2 Server Picker & Region Lock
+    valve_regions: Vec<ValveRegion>,
+    valve_probe_rx: Option<mpsc::Receiver<Vec<ValveRegion>>>,
+    is_probing_regions: bool,
+    cs2_cfg_copied: bool,
+
+    // Cloud Relays
     nodes: Vec<ServerNode>,
     selected_node: usize,
     auto_select_best_node: bool,
@@ -207,7 +223,7 @@ impl Default for AppState {
         let lang = detect_system_language();
         let mut history = VecDeque::with_capacity(40);
         for _ in 0..40 {
-            history.push_back(15.0);
+            history.push_back(12.0);
         }
 
         let supported_games = vec![
@@ -234,16 +250,13 @@ impl Default for AppState {
 
         let initial_logs = match lang {
             Language::Ukrainian => vec![
-                "WPing v2.0 готовий до роботи.".into(),
-                "Нативний ICMP двигун активовано (0 навантаження на CPU).".into(),
+                "WPing v2.1 готовий. Виконується перевірка мережевого стека...".into(),
             ],
             Language::English => vec![
-                "WPing v2.0 ready.".into(),
-                "Native ICMP kernel telemetry active (0% CPU overhead).".into(),
+                "WPing v2.1 ready. Scanning Windows network stack for bottlenecks...".into(),
             ],
             Language::Russian => vec![
-                "WPing v2.0 готов к работе.".into(),
-                "Нативный ICMP движок активирован (0 нагрузки на CPU).".into(),
+                "WPing v2.1 готов. Выполняется проверка сетевого стека...".into(),
             ],
         };
 
@@ -268,10 +281,16 @@ impl Default for AppState {
             auto_apply_power_plan: true,
             auto_clean_ram: true,
             auto_throttle_bg_procs: true,
+            auto_wifi_antiscan: true,
+            wifi_scan_disabled_adapter: None,
             saved_power_plan_guid: None,
             active_power_plan_name: active_plan_name,
             adjusted_bg_pids: Vec::new(),
             last_ram_clean: None,
+
+            health: NetworkHealthReport::default(),
+            health_busy: false,
+            health_rx: None,
 
             tweak_opts: TweakOptions::default(),
             tweak_status_log: initial_logs,
@@ -288,6 +307,11 @@ impl Default for AppState {
             mtu_status_msg: String::new(),
             is_probing_mtu: false,
             mtu_rx: None,
+
+            valve_regions: fallback_valve_regions(),
+            valve_probe_rx: None,
+            is_probing_regions: false,
+            cs2_cfg_copied: false,
 
             nodes: vec![
                 ServerNode {
@@ -360,14 +384,14 @@ impl Default for AppState {
             last_node_update: Instant::now(),
             node_ping_rx: None,
 
-            diag_host: "155.133.226.1".into(),
+            diag_host: "155.133.230.1".into(),
             diag_results: vec![],
             is_pinging: false,
             diag_rx: None,
 
             ping_history: history,
             recent_outcomes: VecDeque::with_capacity(20),
-            current_ping: 15.0,
+            current_ping: 10.0,
             packet_loss: 0.0,
             jitter: 0.5,
             ping_rx: None,
@@ -423,6 +447,51 @@ impl AppState {
         if let Some(p) = get_active_power_plan() {
             self.active_power_plan_name = p.name;
         }
+    }
+
+    fn run_health_audit(&mut self) {
+        if self.health_busy {
+            return;
+        }
+        let adapter = self
+            .adapters
+            .get(self.selected_adapter_idx)
+            .map(|a| a.name.clone())
+            .unwrap_or_default();
+        if adapter.is_empty() {
+            return;
+        }
+        self.health_busy = true;
+        let (tx, rx) = mpsc::channel();
+        self.health_rx = Some(rx);
+        thread::spawn(move || {
+            let rep = audit_network_health(&adapter);
+            let _ = tx.send(rep);
+        });
+    }
+
+    fn run_one_click_max_ping_fix(&mut self) {
+        if self.tweaks_busy {
+            return;
+        }
+        self.tweaks_busy = true;
+        let adapter = self
+            .adapters
+            .get(self.selected_adapter_idx)
+            .map(|a| a.name.clone())
+            .unwrap_or_default();
+        let game_exe = self.supported_games[self.selected_game].exe.to_string();
+        let is_adm = self.is_admin;
+        let fix_dns = self.health.dns_servers.starts_with("192.168.")
+            || self.health.dns_servers.starts_with("10.")
+            || self.health.dns_servers.is_empty();
+        let (tx, rx) = mpsc::channel();
+        self.tweaks_rx = Some(rx);
+
+        thread::spawn(move || {
+            let res = apply_max_ping_fix(&adapter, &game_exe, fix_dns, is_adm);
+            let _ = tx.send(res);
+        });
     }
 
     fn enable_timer_resolution(&mut self) {
@@ -493,6 +562,7 @@ impl AppState {
         self.boost_start_time = Some(Instant::now());
         self.recent_outcomes.clear();
         self.packet_loss = 0.0;
+        flush_dns_and_arp_cache();
         self.start_real_ping_thread();
 
         if self.auto_apply_timer_res {
@@ -521,10 +591,28 @@ impl AppState {
             let active_pid = self.detected_game.as_ref().map(|g| g.pid);
             self.adjusted_bg_pids = balance_processes_for_gaming(active_pid);
         }
+        if self.auto_wifi_antiscan {
+            if let Some(a) = self.adapters.get(self.selected_adapter_idx) {
+                let d_low = a.description.to_lowercase();
+                if d_low.contains("wi-fi") || d_low.contains("wireless") || d_low.contains("802.11") {
+                    if set_wifi_scan_enabled(&a.name, false) {
+                        self.wifi_scan_disabled_adapter = Some(a.name.clone());
+                    }
+                }
+            }
+        }
+        // Automatically fix detected Windows network bottlenecks when running elevated
+        if self.is_admin && self.health.loaded && self.health.issue_count > 0 && !self.tweaks_busy {
+            self.run_one_click_max_ping_fix();
+        }
     }
 
     fn stop_boost_session(&mut self) {
-        if !self.is_boosted && self.adjusted_bg_pids.is_empty() && self.saved_power_plan_guid.is_none() {
+        if !self.is_boosted
+            && self.adjusted_bg_pids.is_empty()
+            && self.saved_power_plan_guid.is_none()
+            && self.wifi_scan_disabled_adapter.is_none()
+        {
             return;
         }
         self.is_boosted = false;
@@ -538,6 +626,9 @@ impl AppState {
         if !self.adjusted_bg_pids.is_empty() {
             restore_balanced_processes(&self.adjusted_bg_pids);
             self.adjusted_bg_pids.clear();
+        }
+        if let Some(wlan_name) = self.wifi_scan_disabled_adapter.take() {
+            let _ = set_wifi_scan_enabled(&wlan_name, true);
         }
         if let Some(prev_guid) = self.saved_power_plan_guid.take() {
             if activate_power_plan(&prev_guid) {
@@ -576,6 +667,29 @@ impl AppState {
         });
     }
 
+    fn refresh_valve_regions_ping(&mut self, fetch_live: bool) {
+        if self.is_probing_regions {
+            return;
+        }
+        self.is_probing_regions = true;
+        let current = self.valve_regions.clone();
+        let bind_ip = self.shared_adapter_ip.read().ok().and_then(|g| g.clone());
+        let (tx, rx) = mpsc::channel();
+        self.valve_probe_rx = Some(rx);
+
+        thread::spawn(move || {
+            let mut regions = if fetch_live {
+                fetch_valve_regions_live()
+            } else {
+                current
+            };
+            for r in &mut regions {
+                r.ping_ms = native_icmp_ping(&r.probe_ip, bind_ip.as_deref(), 32, false, 700);
+            }
+            let _ = tx.send(regions);
+        });
+    }
+
     fn run_dns_benchmark(&mut self) {
         self.is_benching_dns = true;
         let targets: Vec<(usize, &'static str)> = self
@@ -597,7 +711,7 @@ impl AppState {
                         sum += ms;
                         cnt += 1;
                     }
-                    thread::sleep(Duration::from_millis(40));
+                    thread::sleep(Duration::from_millis(35));
                 }
                 let avg = if cnt > 0 { Some(sum / (cnt as f32)) } else { None };
                 let _ = tx.send((idx, avg));
@@ -619,9 +733,9 @@ impl AppState {
 
             let msg = match mtu {
                 Some(m) => match lang {
-                    Language::Ukrainian => format!("✔ Знайдено оптимальний Path MTU без фрагментації: {} байт", m),
-                    Language::English => format!("✔ Optimal non-fragmenting Path MTU found: {} bytes", m),
-                    Language::Russian => format!("✔ Найден оптимальный Path MTU без фрагментации: {} байт", m),
+                    Language::Ukrainian => format!("✔ Оптимальний Path MTU без фрагментації: {} байт", m),
+                    Language::English => format!("✔ Optimal non-fragmenting Path MTU: {} bytes", m),
+                    Language::Russian => format!("✔ Оптимальный Path MTU без фрагментации: {} байт", m),
                 },
                 None => match lang {
                     Language::Ukrainian => "⚠ Не вдалося визначити MTU (ICMP заблоковано)".into(),
@@ -729,7 +843,7 @@ impl AppState {
             for i in 1..=count {
                 if let Some(ms) = prober.ping_ipv4(dst_ip, src_ip, 32, false, 900) {
                     rtts.push(ms);
-                    if !burst_mode || i % 3 == 0 || ms > 60.0 {
+                    if !burst_mode || i % 3 == 0 || ms > 50.0 {
                         let _ = tx.send((format!("[{:02}/{}] Reply from {}: time={:.2} ms", i, count, dst_ip, ms), false));
                     }
                 } else {
@@ -752,20 +866,10 @@ impl AppState {
                 let loss_pct = (lost as f32 / count as f32) * 100.0;
 
                 let _ = tx.send(("─────────────────────────────────────────────".into(), false));
-                let summary = match lang {
-                    Language::Ukrainian => format!(
-                        "✔ Min: {:.1}ms | Avg: {:.1}ms | Max: {:.1}ms | Jitter: {:.2}ms | Loss: {:.1}%",
-                        min, avg, max, jitter, loss_pct
-                    ),
-                    Language::English => format!(
-                        "✔ Min: {:.1}ms | Avg: {:.1}ms | Max: {:.1}ms | Jitter: {:.2}ms | Loss: {:.1}%",
-                        min, avg, max, jitter, loss_pct
-                    ),
-                    Language::Russian => format!(
-                        "✔ Min: {:.1}ms | Avg: {:.1}ms | Max: {:.1}ms | Jitter: {:.2}ms | Loss: {:.1}%",
-                        min, avg, max, jitter, loss_pct
-                    ),
-                };
+                let summary = format!(
+                    "✔ Min: {:.1}ms | Avg: {:.1}ms | Max: {:.1}ms | Jitter: {:.2}ms | Loss: {:.1}%",
+                    min, avg, max, jitter, loss_pct
+                );
                 let _ = tx.send((summary, true));
             } else {
                 let _ = tx.send(("✖ 100% Packet Loss — target unreachable or blocks ICMP.".into(), true));
@@ -790,13 +894,11 @@ impl eframe::App for AppState {
             }
         }
 
-        // Poll timer & RAM periodically
         if self.last_metrics_poll.elapsed() >= Duration::from_secs(1) {
             self.last_metrics_poll = Instant::now();
             self.sync_system_metrics();
         }
 
-        // Auto Standby RAM clean every 3 minutes while boosted if enabled
         if self.is_boosted && self.auto_clean_ram {
             let should_clean = self
                 .last_ram_clean
@@ -806,7 +908,6 @@ impl eframe::App for AppState {
             }
         }
 
-        // Intercept close button [X] -> minimize to tray
         if ctx.input(|i| i.viewport().close_requested()) {
             if !self.allow_exit {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
@@ -822,7 +923,6 @@ impl eframe::App for AppState {
             }
         }
 
-        // Poll tray show message
         if let Some(rx) = &self.tray_show_rx {
             while let Ok(_) = rx.try_recv() {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
@@ -852,7 +952,17 @@ impl eframe::App for AppState {
                 }
                 if first_load {
                     self.refresh_nodes_ping();
+                    self.run_health_audit();
+                    self.refresh_valve_regions_ping(true);
                 }
+            }
+        }
+
+        // Poll Network Health Audit
+        if let Some(rx) = &self.health_rx {
+            while let Ok(rep) = rx.try_recv() {
+                self.health = rep;
+                self.health_busy = false;
             }
         }
 
@@ -876,28 +986,35 @@ impl eframe::App for AppState {
                         .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
                     {
                         self.selected_node = best_idx;
+                        if !self.is_boosted {
+                            if let Some(p) = self.nodes[best_idx].ping_ms {
+                                self.current_ping = p;
+                            }
+                        }
                     }
                 }
             }
         }
 
+        // Poll Valve SDR regions ping
+        if let Some(rx) = &self.valve_probe_rx {
+            while let Ok(list) = rx.try_recv() {
+                self.valve_regions = list;
+                self.is_probing_regions = false;
+            }
+        }
+
         // Poll DNS Benchmark
         if let Some(rx) = &self.dns_bench_rx {
-            let mut count_done = 0;
+            let mut any_recv = false;
             while let Ok((idx, val)) = rx.try_recv() {
                 if idx < self.dns_presets.len() {
                     self.dns_presets[idx].ping_ms = val;
                 }
-                count_done += 1;
+                any_recv = true;
             }
-            if count_done > 0 && self.dns_presets.iter().all(|d| d.ping_ms.is_some()) {
+            if any_recv && self.dns_presets.iter().all(|d| d.ping_ms.is_some()) {
                 self.is_benching_dns = false;
-            }
-            if self.is_benching_dns && count_done > 0 {
-                // fallback clear if final packet timed out
-                if self.dns_bench_rx.is_some() {
-                    self.is_benching_dns = false;
-                }
             }
         }
 
@@ -910,13 +1027,18 @@ impl eframe::App for AppState {
             }
         }
 
-        // Poll Tweaks Async Runner
+        // Poll Tweaks Async Runner -> auto re-audit health!
         if let Some(rx) = &self.tweaks_rx {
+            let mut finished = false;
             while let Ok(lines) = rx.try_recv() {
                 for l in lines {
                     self.tweak_status_log.push(l);
                 }
                 self.tweaks_busy = false;
+                finished = true;
+            }
+            if finished {
+                self.run_health_audit();
             }
         }
 
@@ -955,7 +1077,7 @@ impl eframe::App for AppState {
             }
         }
 
-        // Poll real telemetry channel (exact sub-ms ping, real jitter, real loss)
+        // Poll real telemetry channel
         if let Some(rx) = &self.ping_rx {
             while let Ok(sample) = rx.try_recv() {
                 if self.recent_outcomes.len() >= 20 {
@@ -996,7 +1118,6 @@ impl eframe::App for AppState {
 
         ctx.request_repaint_after(Duration::from_millis(300));
 
-        // Dark Modern Gaming Theme
         let mut style = (*ctx.style()).clone();
         style.visuals.dark_mode = true;
         style.visuals.override_text_color = Some(egui::Color32::from_rgb(224, 232, 244));
@@ -1017,13 +1138,13 @@ impl eframe::App for AppState {
                         .strong(),
                 );
                 ui.label(
-                    egui::RichText::new("v2.0")
+                    egui::RichText::new("v2.1")
                         .font(egui::FontId::proportional(12.0))
                         .color(egui::Color32::from_rgb(0, 200, 255))
                         .strong(),
                 );
                 ui.label(
-                    egui::RichText::new("PING, FPS & INPUT OPTIMIZER")
+                    egui::RichText::new("MAX PING, FPS & INPUT OPTIMIZER")
                         .font(egui::FontId::proportional(11.0))
                         .color(egui::Color32::from_rgb(120, 140, 165)),
                 );
@@ -1041,8 +1162,6 @@ impl eframe::App for AppState {
                     }
 
                     ui.add_space(4.0);
-
-                    // Language Selector
                     egui::ComboBox::from_id_salt("lang_selector_combo")
                         .selected_text(self.language.label())
                         .width(72.0)
@@ -1053,8 +1172,6 @@ impl eframe::App for AppState {
                         });
 
                     ui.add_space(4.0);
-
-                    // Admin Badge / 1-click elevation
                     if self.is_admin {
                         ui.label(
                             egui::RichText::new("🛡️ ADMIN")
@@ -1075,38 +1192,28 @@ impl eframe::App for AppState {
                                 .strong(),
                         )
                         .fill(egui::Color32::from_rgb(255, 190, 60));
-                        if ui.add(btn).clicked() {
-                            if restart_as_admin() {
-                                self.stop_boost_session();
-                                self.allow_exit = true;
-                                std::process::exit(0);
-                            }
+                        if ui.add(btn).clicked() && restart_as_admin() {
+                            self.stop_boost_session();
+                            self.allow_exit = true;
+                            std::process::exit(0);
                         }
                     }
 
                     ui.add_space(6.0);
-
                     if self.is_boosted {
                         let active_label = match lang {
                             Language::Ukrainian => "● БУСТ АКТИВНИЙ",
                             Language::English => "● BOOST ACTIVE",
                             Language::Russian => "● БУСТ АКТИВЕН",
                         };
-                        ui.label(
-                            egui::RichText::new(active_label)
-                                .color(egui::Color32::from_rgb(0, 255, 128))
-                                .strong(),
-                        );
+                        ui.label(egui::RichText::new(active_label).color(egui::Color32::from_rgb(0, 255, 128)).strong());
                     } else {
                         let std_label = match lang {
                             Language::Ukrainian => "○ СТАНДАРТ",
                             Language::English => "○ STANDBY",
                             Language::Russian => "○ СТАНДАРТ",
                         };
-                        ui.label(
-                            egui::RichText::new(std_label)
-                                .color(egui::Color32::from_rgb(135, 145, 160)),
-                        );
+                        ui.label(egui::RichText::new(std_label).color(egui::Color32::from_rgb(135, 145, 160)));
                     }
                 });
             });
@@ -1115,27 +1222,26 @@ impl eframe::App for AppState {
             ui.separator();
             ui.add_space(5.0);
 
-            // Navigation Tabs
             ui.horizontal(|ui| {
                 let tab_titles = match lang {
                     Language::Ukrainian => [
                         (AppTab::Dashboard, "🎮 Оптимізатор"),
                         (AppTab::InputFps, "⚡ Інпут, 0.5ms & FPS"),
-                        (AppTab::NetworkDns, "🌐 Мережа, DNS & MTU"),
+                        (AppTab::NetworkDns, "🌐 Мережа, DNS & Сервери"),
                         (AppTab::LocalTweaks, "⚙️ Твіки Windows"),
                         (AppTab::Diagnostics, "📊 Діагностика"),
                     ],
                     Language::English => [
                         (AppTab::Dashboard, "🎮 Game Optimizer"),
                         (AppTab::InputFps, "⚡ Input, 0.5ms & FPS"),
-                        (AppTab::NetworkDns, "🌐 Network, DNS & MTU"),
+                        (AppTab::NetworkDns, "🌐 Network, DNS & Servers"),
                         (AppTab::LocalTweaks, "⚙️ Windows Tweaks"),
                         (AppTab::Diagnostics, "📊 Diagnostics"),
                     ],
                     Language::Russian => [
                         (AppTab::Dashboard, "🎮 Оптимизатор"),
                         (AppTab::InputFps, "⚡ Инпут, 0.5ms & FPS"),
-                        (AppTab::NetworkDns, "🌐 Сеть, DNS & MTU"),
+                        (AppTab::NetworkDns, "🌐 Сеть, DNS и Серверы"),
                         (AppTab::LocalTweaks, "⚙️ Твики Windows"),
                         (AppTab::Diagnostics, "📊 Диагностика"),
                     ],
@@ -1181,12 +1287,8 @@ impl eframe::App for AppState {
                 };
 
                 let timer_ms = self.timer_res_current_100ns as f32 / 10000.0;
-                let bot_label = format!("WPing v2.0 • {} • Timer: {:.3}ms", adapter_summary, timer_ms);
-                ui.label(
-                    egui::RichText::new(bot_label)
-                        .font(egui::FontId::proportional(11.0))
-                        .color(egui::Color32::from_rgb(120, 138, 158)),
-                );
+                let bot_label = format!("WPing v2.1 • {} • Timer: {:.3}ms", adapter_summary, timer_ms);
+                ui.label(egui::RichText::new(bot_label).font(egui::FontId::proportional(11.0)).color(egui::Color32::from_rgb(120, 138, 158)));
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(
@@ -1205,7 +1307,6 @@ impl eframe::App for AppState {
             ui.add_space(4.0);
         });
 
-        // Main Central Panel
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.add_space(6.0);
             match self.current_tab {
@@ -1277,6 +1378,7 @@ impl AppState {
                                 *lock = a.ip.clone();
                             }
                             self.refresh_nodes_ping();
+                            self.run_health_audit();
                         }
                     }
                 }
@@ -1295,16 +1397,16 @@ impl AppState {
                 ui.add_space(2.0);
                 if a.is_virtual {
                     let warn_msg = match lang {
-                        Language::Ukrainian => "⚠️ УВАГА: Обрано віртуальний VPN! Для ігор та мінімального пінгу оберіть фізичну карту (Ethernet / Wi-Fi).",
-                        Language::English => "⚠️ WARNING: Virtual VPN adapter selected! Select your physical Ethernet/Wi-Fi adapter for lowest latency.",
-                        Language::Russian => "⚠️ ВНИМАНИЕ: Выбран виртуальный VPN! Для игр и минимального пинга выберите физическую карту (Ethernet / Wi-Fi).",
+                        Language::Ukrainian => "⚠️ УВАГА: Обрано віртуальний VPN! Оберіть фізичну карту (Ethernet / Wi-Fi).",
+                        Language::English => "⚠️ WARNING: Virtual VPN selected! Select your physical Ethernet/Wi-Fi adapter.",
+                        Language::Russian => "⚠️ ВНИМАНИЕ: Выбран виртуальный VPN! Выберите физическую карту (Ethernet / Wi-Fi).",
                     };
                     ui.label(egui::RichText::new(warn_msg).font(egui::FontId::proportional(11.0)).color(egui::Color32::from_rgb(255, 170, 0)).strong());
                 } else {
                     let ok_msg = match lang {
-                        Language::Ukrainian => "✔ Прямий фізичний канал активний. Усі виміри ICMP прив'язані до цієї карти.",
-                        Language::English => "✔ Direct physical channel active. All ICMP probes bind directly to this NIC.",
-                        Language::Russian => "✔ Прямой физический канал активен. Все замеры ICMP привязаны к этой карте.",
+                        Language::Ukrainian => "✔ Прямий фізичний канал активний. ICMP заміри прив'язані до цієї карти.",
+                        Language::English => "✔ Direct physical channel active. ICMP probes bind directly to this NIC.",
+                        Language::Russian => "✔ Прямой физический канал активен. ICMP замеры привязаны к этой карте.",
                     };
                     ui.label(egui::RichText::new(ok_msg).font(egui::FontId::proportional(11.0)).color(egui::Color32::from_rgb(0, 230, 153)));
                 }
@@ -1352,9 +1454,105 @@ impl AppState {
             });
         });
 
-        ui.add_space(6.0);
+        ui.add_space(5.0);
+
+        // Live Windows Network Bottleneck Audit Card!
+        if self.health.loaded {
+            let has_issues = self.health.issue_count > 0;
+            let frame_col = if has_issues {
+                egui::Color32::from_rgb(45, 25, 18)
+            } else {
+                egui::Color32::from_rgb(14, 34, 24)
+            };
+            egui::Frame::none()
+                .fill(frame_col)
+                .rounding(6.0)
+                .inner_margin(8.0)
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        if has_issues {
+                            let mut issues = Vec::new();
+                            if self.health.adapter_mtu > 1500 {
+                                issues.push(format!("MTU={} (Jumbo!)", self.health.adapter_mtu));
+                            }
+                            if self.health.rsc_enabled {
+                                issues.push("RSC=ON".into());
+                            }
+                            if self.health.packet_coalescing_enabled {
+                                issues.push("Coalescing=ON".into());
+                            }
+                            if self.health.delayed_ack_timeout_ms > 15 || self.health.delayed_ack_freq > 1 {
+                                issues.push(format!("AckDelay={}ms", self.health.delayed_ack_timeout_ms));
+                            }
+                            if self.health.afd_ignore_push == 1 {
+                                issues.push("AFD IgnorePush=1".into());
+                            }
+                            if self.health.dns_servers.starts_with("192.168.") || self.health.dns_servers.starts_with("10.") {
+                                issues.push("Slow Router DNS".into());
+                            }
+                            if self.health.auto_metric || self.health.interface_metric > 10 {
+                                issues.push(format!("Metric={}", self.health.interface_metric));
+                            }
+                            if self.health.giga_lite_enabled {
+                                issues.push("GigaLite=ON".into());
+                            }
+                            if self.health.global_timer_win11 != 1 {
+                                issues.push("Win11 GlobalTimer=0".into());
+                            }
+
+                            let summary = issues.join(" • ");
+                            let lbl = match lang {
+                                Language::Ukrainian => format!("⚠️ Гальма пінгу ({}): {}", self.health.issue_count, summary),
+                                Language::English => format!("⚠️ Ping Bottlenecks ({}): {}", self.health.issue_count, summary),
+                                Language::Russian => format!("⚠️ Тормоза пинга ({}): {}", self.health.issue_count, summary),
+                            };
+                            ui.label(egui::RichText::new(lbl).font(egui::FontId::proportional(11.5)).color(egui::Color32::from_rgb(255, 190, 90)).strong());
+
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                let fix_txt = if self.tweaks_busy {
+                                    "⏳...".to_string()
+                                } else {
+                                    match lang {
+                                        Language::Ukrainian => "⚡ ВИПРАВИТИ ВСЕ В 1 КЛІК",
+                                        Language::English => "⚡ FIX ALL NOW (1-CLICK)",
+                                        Language::Russian => "⚡ ИСПРАВИТЬ ВСЁ В 1 КЛИК",
+                                    }.into()
+                                };
+                                let btn = egui::Button::new(egui::RichText::new(fix_txt).font(egui::FontId::proportional(11.5)).color(egui::Color32::BLACK).strong())
+                                    .fill(egui::Color32::from_rgb(255, 195, 50));
+                                if ui.add_enabled(!self.tweaks_busy, btn).clicked() {
+                                    self.run_one_click_max_ping_fix();
+                                }
+                            });
+                        } else {
+                            let ok_txt = match lang {
+                                Language::Ukrainian => format!(
+                                    "✔ МЕРЕЖА ОПТИМІЗОВАНА НА 100%: MTU {} | RSC Off | Ack {}ms | {} | Metric {}",
+                                    self.health.adapter_mtu, self.health.delayed_ack_timeout_ms, self.health.congestion_provider.to_uppercase(), self.health.interface_metric
+                                ),
+                                Language::English => format!(
+                                    "✔ NETWORK 100% OPTIMIZED: MTU {} | RSC Off | Ack {}ms | {} | Metric {}",
+                                    self.health.adapter_mtu, self.health.delayed_ack_timeout_ms, self.health.congestion_provider.to_uppercase(), self.health.interface_metric
+                                ),
+                                Language::Russian => format!(
+                                    "✔ СЕТЬ ОПТИМИЗИРОВАНА НА 100%: MTU {} | RSC Off | Ack {}ms | {} | Metric {}",
+                                    self.health.adapter_mtu, self.health.delayed_ack_timeout_ms, self.health.congestion_provider.to_uppercase(), self.health.interface_metric
+                                ),
+                            };
+                            ui.label(egui::RichText::new(ok_txt).font(egui::FontId::proportional(11.5)).color(egui::Color32::from_rgb(0, 240, 150)).strong());
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.small_button("🔄").clicked() {
+                                    self.run_health_audit();
+                                }
+                            });
+                        }
+                    });
+                });
+            ui.add_space(5.0);
+        }
+
         self.render_adapter_selector(ui);
-        ui.add_space(8.0);
+        ui.add_space(6.0);
 
         ui.horizontal(|ui| {
             // Left Column
@@ -1390,9 +1588,9 @@ impl AppState {
                             }
                         });
 
-                    ui.add_space(10.0);
-                    ui.separator();
                     ui.add_space(8.0);
+                    ui.separator();
+                    ui.add_space(6.0);
 
                     let node_location = self.nodes[self.selected_node].location(lang);
                     let node_name = self.nodes[self.selected_node].name;
@@ -1402,9 +1600,8 @@ impl AppState {
                     };
                     ui.label(egui::RichText::new(format!("📍 {} ({}){}", node_location, node_name, node_ping_str)).strong());
 
-                    ui.add_space(8.0);
+                    ui.add_space(6.0);
 
-                    // Live System Stack Status Pills
                     egui::Frame::none()
                         .fill(egui::Color32::from_rgb(20, 26, 35))
                         .rounding(6.0)
@@ -1430,7 +1627,7 @@ impl AppState {
                             });
                         });
 
-                    ui.add_space(12.0);
+                    ui.add_space(10.0);
 
                     if !self.is_boosted {
                         let boost_btn_text = match lang {
@@ -1445,7 +1642,7 @@ impl AppState {
                                 .strong(),
                         )
                         .fill(egui::Color32::from_rgb(0, 235, 160))
-                        .min_size(egui::vec2(420.0, 50.0));
+                        .min_size(egui::vec2(420.0, 46.0));
 
                         if ui.add(boost_btn).clicked() {
                             self.start_boost_session();
@@ -1463,7 +1660,7 @@ impl AppState {
                                 .strong(),
                         )
                         .fill(egui::Color32::from_rgb(215, 55, 65))
-                        .min_size(egui::vec2(420.0, 50.0));
+                        .min_size(egui::vec2(420.0, 46.0));
 
                         if ui.add(stop_btn).clicked() {
                             self.stop_boost_session();
@@ -1475,19 +1672,19 @@ impl AppState {
                         let elapsed = self.boost_start_time.map_or(0, |t| t.elapsed().as_secs());
                         let active_str = match lang {
                             Language::Ukrainian => format!(
-                                "✔ Активно: {:02}:{:02} | Оптимізовано для {} | RAM: {:.1}GB вільно",
+                                "✔ Активно: {:02}:{:02} | Для: {} | RAM: {:.1}GB вільно",
                                 elapsed / 60, elapsed % 60,
                                 self.supported_games[self.selected_game].name,
                                 self.mem_stats.avail_mb as f32 / 1024.0
                             ),
                             Language::English => format!(
-                                "✔ Active: {:02}:{:02} | Optimized for {} | RAM Free: {:.1}GB",
+                                "✔ Active: {:02}:{:02} | For: {} | RAM Free: {:.1}GB",
                                 elapsed / 60, elapsed % 60,
                                 self.supported_games[self.selected_game].name,
                                 self.mem_stats.avail_mb as f32 / 1024.0
                             ),
                             Language::Russian => format!(
-                                "✔ Активно: {:02}:{:02} | Оптимизировано для {} | RAM: {:.1}GB свободно",
+                                "✔ Активно: {:02}:{:02} | Для: {} | RAM: {:.1}GB свободно",
                                 elapsed / 60, elapsed % 60,
                                 self.supported_games[self.selected_game].name,
                                 self.mem_stats.avail_mb as f32 / 1024.0
@@ -1496,9 +1693,9 @@ impl AppState {
                         ui.label(egui::RichText::new(active_str).font(egui::FontId::proportional(11.5)).color(egui::Color32::from_rgb(0, 230, 153)));
                     } else {
                         let desc = match lang {
-                            Language::Ukrainian => "Активує 0.5ms таймер, 0 Delay клавіатуру, Ultimate Power, очищення RAM та нативну телеметрію.",
-                            Language::English => "Activates 0.5ms kernel timer, zero-delay keyboard, Ultimate Power, RAM cleaner, and native telemetry.",
-                            Language::Russian => "Активирует 0.5ms таймер, 0 Delay клавиатуру, Ultimate Power, очистку RAM и нативную телеметрию.",
+                            Language::Ukrainian => "Активує 0.5ms, FilterKeys, Ultimate Power, чистку RAM, Wi-Fi Anti-Scan і нативну телеметрію.",
+                            Language::English => "Enables 0.5ms, FilterKeys, Ultimate Power, RAM clean, Wi-Fi Anti-Scan & kernel telemetry.",
+                            Language::Russian => "Активирует 0.5ms, FilterKeys, Ultimate Power, чистку RAM, Wi-Fi Anti-Scan и нативную телеметрию.",
                         };
                         ui.label(egui::RichText::new(desc).font(egui::FontId::proportional(11.5)).color(egui::Color32::GRAY));
                     }
@@ -1507,7 +1704,7 @@ impl AppState {
 
             ui.add_space(10.0);
 
-            // Right Column: Real-Time Telemetry
+            // Right Column: Telemetry
             ui.vertical(|ui| {
                 ui.group(|ui| {
                     ui.set_width(395.0);
@@ -1568,7 +1765,7 @@ impl AppState {
                         });
                     });
 
-                    ui.add_space(10.0);
+                    ui.add_space(8.0);
                     ui.separator();
                     ui.add_space(6.0);
 
@@ -1580,14 +1777,14 @@ impl AppState {
                     };
 
                     let graph_lbl = match lang {
-                        Language::Ukrainian => format!("Графік стабільності (Min: {:.1} | Avg: {:.1} | Max: {:.1} ms):", min_p, avg_p, max_p),
-                        Language::English => format!("Latency stability (Min: {:.1} | Avg: {:.1} | Max: {:.1} ms):", min_p, avg_p, max_p),
-                        Language::Russian => format!("График стабильности (Min: {:.1} | Avg: {:.1} | Max: {:.1} ms):", min_p, avg_p, max_p),
+                        Language::Ukrainian => format!("Стабільність (Min: {:.1} | Avg: {:.1} | Max: {:.1} ms):", min_p, avg_p, max_p),
+                        Language::English => format!("Stability (Min: {:.1} | Avg: {:.1} | Max: {:.1} ms):", min_p, avg_p, max_p),
+                        Language::Russian => format!("Стабильность (Min: {:.1} | Avg: {:.1} | Max: {:.1} ms):", min_p, avg_p, max_p),
                     };
                     ui.label(egui::RichText::new(graph_lbl).font(egui::FontId::proportional(11.5)).strong());
                     ui.add_space(6.0);
 
-                    let (response, painter) = ui.allocate_painter(egui::vec2(375.0, 95.0), egui::Sense::hover());
+                    let (response, painter) = ui.allocate_painter(egui::vec2(375.0, 90.0), egui::Sense::hover());
                     let rect = response.rect;
                     painter.rect_filled(rect, 4.0, egui::Color32::from_rgb(10, 13, 18));
 
@@ -1713,13 +1910,12 @@ impl AppState {
                         };
                         ui.checkbox(&mut self.auto_apply_timer_res, auto_timer_lbl);
 
-                        ui.add_space(4.0);
-                        let win11_tip = match lang {
-                            Language::Ukrainian => "💡 Порада: для Windows 11 увімкніть 'Win11 Global Timer Fix' у вкладці 'Твіки Windows', щоб 0.5ms працював для всіх ігор.",
-                            Language::English => "💡 Tip: On Windows 11 enable 'Win11 Global Timer Fix' in 'Windows Tweaks' so 0.5ms applies globally to games.",
-                            Language::Russian => "💡 Совет: для Windows 11 включите 'Win11 Global Timer Fix' во вкладке 'Твики Windows', чтобы 0.5ms работал для всех игр.",
+                        let wifi_lbl = match lang {
+                            Language::Ukrainian => "Wi-Fi Anti-Scan (зупиняти фоновий скан мереж під час гри)",
+                            Language::English => "Wi-Fi Anti-Scan (pause background SSID scans while boosted)",
+                            Language::Russian => "Wi-Fi Anti-Scan (отключать фоновый скан сетей во время игры)",
                         };
-                        ui.label(egui::RichText::new(win11_tip).font(egui::FontId::proportional(11.0)).color(egui::Color32::GRAY));
+                        ui.checkbox(&mut self.auto_wifi_antiscan, wifi_lbl);
                     });
                 });
 
@@ -1802,15 +1998,15 @@ impl AppState {
                         ui.horizontal(|ui| {
                             let (m_lbl, m_btn) = match lang {
                                 Language::Ukrainian => (
-                                    if !self.mouse_accel_enabled { "🎯 Акселерація миші: ВИМКНЕНА (1:1 Raw Aim ✔)" } else { "⚠️ Акселерація миші: УВІМКНЕНА" },
+                                    if !self.mouse_accel_enabled { "🎯 Миша: 1:1 Raw Aim (Акселерація Вимк ✔)" } else { "⚠️ Акселерація миші: УВІМКНЕНА" },
                                     if self.mouse_accel_enabled { "Вимкнути (1:1)" } else { "Увімкнути" },
                                 ),
                                 Language::English => (
-                                    if !self.mouse_accel_enabled { "🎯 Mouse Accel: OFF (1:1 Raw Aim ✔)" } else { "⚠️ Mouse Accel: ON" },
+                                    if !self.mouse_accel_enabled { "🎯 Mouse: 1:1 Raw Aim (Accel OFF ✔)" } else { "⚠️ Mouse Accel: ON" },
                                     if self.mouse_accel_enabled { "Disable (1:1)" } else { "Enable" },
                                 ),
                                 Language::Russian => (
-                                    if !self.mouse_accel_enabled { "🎯 Акселерация мыши: ВЫКЛ (1:1 Raw Aim ✔)" } else { "⚠️ Акселерация мыши: ВКЛ" },
+                                    if !self.mouse_accel_enabled { "🎯 Мышь: 1:1 Raw Aim (Ускорение Выкл ✔)" } else { "⚠️ Ускорение мыши: ВКЛ" },
                                     if self.mouse_accel_enabled { "Отключить (1:1)" } else { "Включить" },
                                 ),
                             };
@@ -1836,7 +2032,7 @@ impl AppState {
 
             ui.add_space(8.0);
 
-            // BOTTOM WIDE CARD: FPS Booster (Power Plan + Standby RAM Cleaner + Process Balancer)
+            // BOTTOM WIDE CARD: FPS Booster
             ui.group(|ui| {
                 ui.set_width(874.0);
                 let fps_title = match lang {
@@ -1848,7 +2044,6 @@ impl AppState {
                 ui.add_space(6.0);
 
                 ui.horizontal(|ui| {
-                    // Memory & Standby Cleaner
                     ui.vertical(|ui| {
                         ui.set_width(420.0);
                         let ram_text = format!(
@@ -1877,16 +2072,15 @@ impl AppState {
                             ui.label(egui::RichText::new(&self.ram_clean_status).font(egui::FontId::proportional(11.0)).color(egui::Color32::from_rgb(0, 230, 153)));
                         }
                         let auto_ram_lbl = match lang {
-                            Language::Ukrainian => "Авто-очищення RAM при старті бусту (+ кожні 3 хв при навантаженні)",
+                            Language::Ukrainian => "Авто-очищення RAM при бусті (+ кожні 3 хв при навантаженні)",
                             Language::English => "Auto-clean RAM on boost (+ every 3m if >=70% used)",
-                            Language::Russian => "Авто-очистка RAM при старте буста (+ каждые 3 мин при нагрузке)",
+                            Language::Russian => "Авто-очистка RAM при бусте (+ каждые 3 мин при нагрузке)",
                         };
                         ui.checkbox(&mut self.auto_clean_ram, auto_ram_lbl);
                     });
 
                     ui.add_space(16.0);
 
-                    // Power Plan & Process Balancer
                     ui.vertical(|ui| {
                         ui.set_width(420.0);
                         let pwr_lbl = match lang {
@@ -1910,7 +2104,7 @@ impl AppState {
 
                         let auto_pwr_lbl = match lang {
                             Language::Ukrainian => "Авто-перемикання на Ultimate Performance під час бусту",
-                            Language::English => "Auto-switch to Ultimate Performance during game boost",
+                            Language::English => "Auto-switch to Ultimate Performance during boost",
                             Language::Russian => "Авто-переключение на Ultimate Performance во время буста",
                         };
                         ui.checkbox(&mut self.auto_apply_power_plan, auto_pwr_lbl);
@@ -1934,71 +2128,108 @@ impl AppState {
         ui.add_space(6.0);
 
         egui::ScrollArea::vertical().show(ui, |ui| {
-            // Game Relay Table
+            // CS2 / Dota 2 EU Valve Server Picker & Safe Firewall Region Lock
             ui.group(|ui| {
+                ui.set_width(874.0);
                 ui.horizontal(|ui| {
-                    let h = match lang {
-                        Language::Ukrainian => "🌐 Ігрові релеї та сервери (Нативний ICMP замір кожні 10с)",
-                        Language::English => "🌐 Game Relays & Cloud Nodes (Native ICMP probed every 10s)",
-                        Language::Russian => "🌐 Игровые релеи и серверы (Нативный ICMP замер каждые 10с)",
+                    let cs_hdr = match lang {
+                        Language::Ukrainian => "🎯 Вибір серверів CS2 / Dota 2 (Зниження ігрового пінгу за рахунок регіонів)",
+                        Language::English => "🎯 CS2 / Dota 2 Low-Ping Server Picker (Official Valve SDR Relays)",
+                        Language::Russian => "🎯 Выбор серверов CS2 / Dota 2 (Снижение игрового пинга за счет регионов)",
                     };
-                    ui.heading(h);
+                    ui.label(egui::RichText::new(cs_hdr).font(egui::FontId::proportional(14.0)).color(egui::Color32::from_rgb(0, 235, 160)).strong());
+
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let smart_lbl = match lang {
-                            Language::Ukrainian => "Smart Routing (Авто-вибір)",
-                            Language::English => "Smart Routing (Auto-pick fastest)",
-                            Language::Russian => "Smart Routing (Авто-выбор)",
-                        };
-                        ui.checkbox(&mut self.auto_select_best_node, smart_lbl);
+                        let ref_srv = if self.is_probing_regions { "⏳..." } else { "🔄 Ping Relays" };
+                        if ui.add_enabled(!self.is_probing_regions, egui::Button::new(ref_srv)).clicked() {
+                            self.refresh_valve_regions_ping(true);
+                        }
                     });
                 });
 
                 ui.add_space(4.0);
-                for (idx, node) in self.nodes.iter().enumerate() {
-                    ui.horizontal(|ui| {
-                        let is_sel = self.selected_node == idx;
-                        if ui.selectable_label(is_sel, format!("📍 {}", node.location(lang))).clicked() {
-                            self.selected_node = idx;
-                            self.auto_select_best_node = false;
-                            if let Some(p) = node.ping_ms {
-                                self.current_ping = p;
-                            }
-                        }
-                        ui.label(egui::RichText::new(format!("• {} ({})", node.name, node.host)).font(egui::FontId::proportional(11.5)).color(egui::Color32::GRAY));
-
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if let Some(p) = node.ping_ms {
-                                let col = if p < 20.0 {
-                                    egui::Color32::from_rgb(0, 255, 128)
-                                } else if p < 40.0 {
-                                    egui::Color32::from_rgb(0, 210, 255)
-                                } else {
-                                    egui::Color32::from_rgb(255, 170, 0)
-                                };
-                                ui.label(egui::RichText::new(format!("{:.1} ms", p)).color(col).strong());
-                            } else {
-                                ui.label(egui::RichText::new("⏳ ...").color(egui::Color32::GRAY));
-                            }
-                        });
-                    });
-                    ui.separator();
-                }
-
-                let ref_btn = match lang {
-                    Language::Ukrainian => "🔄 Оновити пінг релеїв зараз",
-                    Language::English => "🔄 Refresh all relay pings now",
-                    Language::Russian => "🔄 Обновить пинг релеев сейчас",
+                let cs_sub = match lang {
+                    Language::Ukrainian => "Оберіть лише найближчі сервери (напр. Warsaw ~9ms + Stockholm/Frankfurt), щоб матчмейкінг не кидав у Vienna/London/Madrid (36-75ms):",
+                    Language::English => "Select only closest low-ping regions so matchmaking never throws you into distant 40-75ms EU servers:",
+                    Language::Russian => "Выберите только ближайшие серверы (напр. Warsaw ~9ms + Stockholm/Frankfurt), чтобы матчмейкинг не кидал в 36-75ms:",
                 };
-                if ui.button(ref_btn).clicked() {
-                    self.refresh_nodes_ping();
-                }
+                ui.label(egui::RichText::new(cs_sub).font(egui::FontId::proportional(11.0)).color(egui::Color32::GRAY));
+                ui.add_space(4.0);
+
+                ui.horizontal_wrapped(|ui| {
+                    for r in &mut self.valve_regions {
+                        let p_str = match r.ping_ms {
+                            Some(ms) => format!("{:.0}ms", ms),
+                            None => "...".into(),
+                        };
+                        let col = match r.ping_ms {
+                            Some(ms) if ms < 22.0 => egui::Color32::from_rgb(0, 255, 130),
+                            Some(ms) if ms < 32.0 => egui::Color32::from_rgb(0, 210, 255),
+                            Some(_) => egui::Color32::from_rgb(255, 150, 60),
+                            None => egui::Color32::GRAY,
+                        };
+                        let txt = format!("{} [{}]", r.name, p_str);
+                        ui.checkbox(&mut r.keep_enabled, egui::RichText::new(txt).font(egui::FontId::proportional(11.5)).color(col));
+                    }
+                });
+
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button("⚡ Only <28ms (Best)").clicked() {
+                        for r in &mut self.valve_regions {
+                            r.keep_enabled = r.ping_ms.map_or(matches!(r.code.as_str(), "waw" | "sto" | "fra"), |p| p < 28.0);
+                        }
+                    }
+
+                    let lock_txt = match lang {
+                        Language::Ukrainian => "🔒 ЗАБЛОКУВАТИ ДАЛЬНІ СЕРВЕРИ (FIREWALL)",
+                        Language::English => "🔒 BLOCK FAR SERVERS (FIREWALL LOCK)",
+                        Language::Russian => "🔒 ЗАБЛОКИРОВАТЬ ДАЛЬНИЕ СЕРВЕРЫ (FIREWALL)",
+                    };
+                    if ui.add_enabled(!self.tweaks_busy, egui::Button::new(egui::RichText::new(lock_txt).color(egui::Color32::BLACK).strong()).fill(egui::Color32::from_rgb(0, 230, 153))).clicked() {
+                        self.tweaks_busy = true;
+                        let regs = self.valve_regions.clone();
+                        let is_adm = self.is_admin;
+                        let (tx, rx) = mpsc::channel();
+                        self.tweaks_rx = Some(rx);
+                        thread::spawn(move || {
+                            let res = apply_region_lock(&regs, is_adm);
+                            let _ = tx.send(res);
+                        });
+                    }
+
+                    let unlock_txt = match lang {
+                        Language::Ukrainian => "🔓 Розблокувати всі",
+                        Language::English => "🔓 Unlock All",
+                        Language::Russian => "🔓 Разблокировать все",
+                    };
+                    if ui.add_enabled(!self.tweaks_busy, egui::Button::new(unlock_txt)).clicked() {
+                        self.tweaks_busy = true;
+                        let is_adm = self.is_admin;
+                        let (tx, rx) = mpsc::channel();
+                        self.tweaks_rx = Some(rx);
+                        thread::spawn(move || {
+                            let res = clear_region_lock(is_adm);
+                            let _ = tx.send(res);
+                        });
+                    }
+
+                    let cs_cmd_lbl = if self.cs2_cfg_copied {
+                        "✔ Скопійовано в буфер!"
+                    } else {
+                        "📋 Копіювати команди CS2 (maxping 25)"
+                    };
+                    if ui.button(cs_cmd_lbl).clicked() {
+                        ui.output_mut(|o| o.copied_text = "mm_dedicated_search_maxping 25; rate 1000000; cl_net_buffer_ticks 0; cl_interp_ratio 1".into());
+                        self.cs2_cfg_copied = true;
+                    }
+                });
             });
 
             ui.add_space(8.0);
 
-            // Two Bottom Cards: DNS Benchmark + MTU Optimizer
+            // Two Middle Cards: DNS Benchmark + MTU Optimizer
             ui.horizontal(|ui| {
-                // DNS Switcher
                 ui.vertical(|ui| {
                     ui.set_width(470.0);
                     ui.group(|ui| {
@@ -2047,18 +2278,18 @@ impl AppState {
                         ui.add_space(6.0);
                         ui.horizontal(|ui| {
                             let bench_txt = match lang {
-                                Language::Ukrainian => "🔍 Тест швидкості DNS",
+                                Language::Ukrainian => "🔍 Тест DNS",
                                 Language::English => "🔍 Benchmark DNS",
-                                Language::Russian => "🔍 Тест скорости DNS",
+                                Language::Russian => "🔍 Тест DNS",
                             };
                             if ui.button(bench_txt).clicked() {
                                 self.run_dns_benchmark();
                             }
 
                             let reset_txt = match lang {
-                                Language::Ukrainian => "↩ Скинути DNS на Авто",
-                                Language::English => "↩ Reset to Auto DHCP",
-                                Language::Russian => "↩ Сбросить DNS на Авто",
+                                Language::Ukrainian => "↩ Авто DHCP",
+                                Language::English => "↩ Auto DHCP",
+                                Language::Russian => "↩ Авто DHCP",
                             };
                             let ad_name = self.adapters.get(self.selected_adapter_idx).map(|a| a.name.clone()).unwrap_or_default();
                             if ui.add_enabled(!ad_name.is_empty(), egui::Button::new(reset_txt)).clicked() {
@@ -2076,22 +2307,21 @@ impl AppState {
 
                 ui.add_space(8.0);
 
-                // Path MTU Discovery
                 ui.vertical(|ui| {
                     ui.set_width(390.0);
                     ui.group(|ui| {
                         let mtu_h = match lang {
-                            Language::Ukrainian => "📐 Оптимальний Path MTU (Без фрагментації)",
-                            Language::English => "📐 Optimal Path MTU Finder (Zero Fragmentation)",
-                            Language::Russian => "📐 Оптимальный Path MTU (Без фрагментации)",
+                            Language::Ukrainian => "📐 Оптимальний Path MTU (Jumbo Fix)",
+                            Language::English => "📐 Optimal Path MTU Finder",
+                            Language::Russian => "📐 Оптимальный Path MTU (Jumbo Fix)",
                         };
                         ui.label(egui::RichText::new(mtu_h).font(egui::FontId::proportional(14.0)).strong());
                         ui.add_space(4.0);
 
                         let mtu_desc = match lang {
-                            Language::Ukrainian => "Знаходить максимальний розмір пакета без роздроблення на лінії провайдера (1500 Ethernet / 1492 PPPoE).",
-                            Language::English => "Finds highest non-fragmented packet size on your ISP line (1500 Ethernet / 1492 PPPoE).",
-                            Language::Russian => "Находит максимальный размер пакета без фрагментации на линии провайдера (1500 Ethernet / 1492 PPPoE).",
+                            Language::Ukrainian => "Знаходить максимальний MTU без фрагментації (1500 / 1492) і прибирає зламані Jumbo-кадри 9000.",
+                            Language::English => "Finds max non-fragmented MTU (1500 / 1492) and fixes broken 9000 Jumbo Frames.",
+                            Language::Russian => "Находит макс. MTU без фрагментации (1500 / 1492) и убирает сломанный Jumbo 9000.",
                         };
                         ui.label(egui::RichText::new(mtu_desc).font(egui::FontId::proportional(11.0)).color(egui::Color32::GRAY));
                         ui.add_space(6.0);
@@ -2129,6 +2359,52 @@ impl AppState {
                     });
                 });
             });
+
+            ui.add_space(8.0);
+
+            // Cloud Relay Monitor Nodes
+            ui.group(|ui| {
+                ui.set_width(874.0);
+                ui.horizontal(|ui| {
+                    let h = match lang {
+                        Language::Ukrainian => "🌐 Моніторинг маршрутів до релеїв (Оновлення кожні 10с)",
+                        Language::English => "🌐 Live Relay Route Monitor (Refreshes every 10s)",
+                        Language::Russian => "🌐 Мониторинг маршрутов к релеям (Обновление каждые 10с)",
+                    };
+                    ui.label(egui::RichText::new(h).font(egui::FontId::proportional(13.5)).strong());
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let smart_lbl = match lang {
+                            Language::Ukrainian => "Smart Routing (Авто-вибір)",
+                            Language::English => "Smart Routing (Auto-pick)",
+                            Language::Russian => "Smart Routing (Авто-выбор)",
+                        };
+                        ui.checkbox(&mut self.auto_select_best_node, smart_lbl);
+                    });
+                });
+
+                for (idx, node) in self.nodes.iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        let is_sel = self.selected_node == idx;
+                        if ui.selectable_label(is_sel, format!("📍 {}", node.location(lang))).clicked() {
+                            self.selected_node = idx;
+                            self.auto_select_best_node = false;
+                            if let Some(p) = node.ping_ms {
+                                self.current_ping = p;
+                            }
+                        }
+                        ui.label(egui::RichText::new(format!("• {} ({})", node.name, node.host)).font(egui::FontId::proportional(11.0)).color(egui::Color32::GRAY));
+
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if let Some(p) = node.ping_ms {
+                                let col = if p < 20.0 { egui::Color32::from_rgb(0, 255, 128) } else if p < 40.0 { egui::Color32::from_rgb(0, 210, 255) } else { egui::Color32::from_rgb(255, 170, 0) };
+                                ui.label(egui::RichText::new(format!("{:.1} ms", p)).color(col).strong());
+                            } else {
+                                ui.label(egui::RichText::new("⏳ ...").color(egui::Color32::GRAY));
+                            }
+                        });
+                    });
+                }
+            });
         });
     }
 
@@ -2152,58 +2428,26 @@ impl AppState {
                     ui.set_width(430.0);
                     ui.group(|ui| {
                         let net_hdr = match lang {
-                            Language::Ukrainian => "🌐 Мережа, Пінг та NIC Драйвер",
-                            Language::English => "🌐 Network, Ping & NIC Hardware",
-                            Language::Russian => "🌐 Сеть, Пинг и NIC Драйвер",
+                            Language::Ukrainian => "🌐 Мережа, TCP-стек, MTU & NIC Драйвер",
+                            Language::English => "🌐 Network, TCP Stack, MTU & NIC Driver",
+                            Language::Russian => "🌐 Сеть, TCP-стек, MTU и NIC Драйвер",
                         };
                         ui.label(egui::RichText::new(net_hdr).font(egui::FontId::proportional(14.0)).color(egui::Color32::from_rgb(0, 220, 255)).strong());
-                        ui.add_space(6.0);
+                        ui.add_space(4.0);
 
-                        let (t1, d1) = match lang {
-                            Language::Ukrainian => ("Вимкнути Nagle (TcpAckFrequency=1, TCPNoDelay=1)", "Миттєва відправка пакетів без буферної черги."),
-                            Language::English => ("Disable Nagle (TcpAckFrequency=1, TCPNoDelay=1)", "Instant packet dispatch without TCP buffering delay."),
-                            Language::Russian => ("Отключить Nagle (TcpAckFrequency=1, TCPNoDelay=1)", "Моментальная отправка пакетов без буферной очереди."),
-                        };
-                        ui.checkbox(&mut self.tweak_opts.tweak_nagle, egui::RichText::new(t1).strong());
-                        ui.label(egui::RichText::new(d1).font(egui::FontId::proportional(10.5)).color(egui::Color32::GRAY));
-
-                        let (t2, d2) = match lang {
-                            Language::Ukrainian => ("NetworkThrottlingIndex=0xffffffff & Resp=0", "Виділяє 100% мережевого планувальника іграм."),
-                            Language::English => ("NetworkThrottlingIndex=0xffffffff & Resp=0", "Gives 100% network scheduling priority to games."),
-                            Language::Russian => ("NetworkThrottlingIndex=0xffffffff & Resp=0", "Выделяет 100% сетевого планировщика играм."),
-                        };
-                        ui.checkbox(&mut self.tweak_opts.tweak_throttling, egui::RichText::new(t2).strong());
-                        ui.label(egui::RichText::new(d2).font(egui::FontId::proportional(10.5)).color(egui::Color32::GRAY));
-
-                        let (t3, d3) = match lang {
-                            Language::Ukrainian => ("QoS DSCP 46 (EF) + 0% ліміту оновлень Windows", "Пріоритет пакетів гри на роутері + зняття 20% резерву."),
-                            Language::English => ("QoS DSCP 46 (EF) + 0% Reserved Bandwidth", "Tags game traffic Expedited Forwarding & removes 20% limit."),
-                            Language::Russian => ("QoS DSCP 46 (EF) + 0% лимита обновлений Windows", "Приоритет пакетов игры на роутере + снятие 20% резерва."),
-                        };
-                        ui.checkbox(&mut self.tweak_opts.tweak_qos, egui::RichText::new(t3).strong());
-                        ui.label(egui::RichText::new(d3).font(egui::FontId::proportional(10.5)).color(egui::Color32::GRAY));
-
-                        let (t4, d4) = match lang {
-                            Language::Ukrainian => ("Пріоритет фізичної карти над VPN (Metric 5 vs 50)", "Radmin/Hamachi більше не крадуть маршрут гри."),
-                            Language::English => ("Physical Adapter Priority over VPN (Metric 5 vs 50)", "Prevents Radmin/Hamachi from hijacking routes."),
-                            Language::Russian => ("Приоритет физической карты над VPN (Metric 5 vs 50)", "Radmin/Hamachi больше не крадут маршрут игры."),
-                        };
-                        ui.checkbox(&mut self.tweak_opts.tweak_nic_metric, egui::RichText::new(t4).strong());
-                        ui.label(egui::RichText::new(d4).font(egui::FontId::proportional(10.5)).color(egui::Color32::GRAY));
-
-                        let (t5, d5) = match lang {
-                            Language::Ukrainian => ("Глибокий тюнінг карти (Interrupt Moderation=Off, EEE=Off)", "Прибирає паузи драйвера мережевої карти та енергозбереження."),
-                            Language::English => ("Deep NIC Driver Tuning (InterruptMod=Off, EEE=Off, RSS=On)", "Eliminates NIC packet coalescing jitter & micro-sleeps."),
-                            Language::Russian => ("Глубокий тюнинг карты (Interrupt Moderation=Off, EEE=Off)", "Убирает паузы драйвера сетевой карты и энергосбережение."),
-                        };
-                        ui.checkbox(&mut self.tweak_opts.tweak_nic_hardware, egui::RichText::new(t5).strong());
-                        ui.label(egui::RichText::new(d5).font(egui::FontId::proportional(10.5)).color(egui::Color32::GRAY));
+                        ui.checkbox(&mut self.tweak_opts.tweak_nagle, egui::RichText::new("Disable Nagle (TcpAckFrequency=1, TCPNoDelay=1, DelAck=0)").strong());
+                        ui.checkbox(&mut self.tweak_opts.tweak_tcp_stack, egui::RichText::new("Deep TCP Stack: RSC=Off, PacketCoalescing=Off, Ack=10ms/1, BBR2/CTCP").strong());
+                        ui.checkbox(&mut self.tweak_opts.tweak_afd_mtu, egui::RichText::new("Winsock AFD Fast-Path + Fix MTU=1500 (Jumbo Off, P2P Off)").strong());
+                        ui.checkbox(&mut self.tweak_opts.tweak_throttling, egui::RichText::new("NetworkThrottlingIndex=0xffffffff & MMCSS Games High").strong());
+                        ui.checkbox(&mut self.tweak_opts.tweak_qos, egui::RichText::new("QoS DSCP 46 (EF) + Remove 20% Bandwidth Limit").strong());
+                        ui.checkbox(&mut self.tweak_opts.tweak_nic_metric, egui::RichText::new("Physical Metric=5 (AutoMetric=Off) vs VPN Metric=500").strong());
+                        ui.checkbox(&mut self.tweak_opts.tweak_nic_hardware, egui::RichText::new("NIC Driver: InterruptMod=Off, GigaLite=Off, EEE=Off, RSS=On").strong());
                     });
                 });
 
                 ui.add_space(8.0);
 
-                // RIGHT: FPS & Kernel Tweaks + Actions
+                // RIGHT: FPS & Kernel Tweaks
                 ui.vertical(|ui| {
                     ui.set_width(430.0);
                     ui.group(|ui| {
@@ -2213,55 +2457,40 @@ impl AppState {
                             Language::Russian => "🚀 FPS, Видеокарта и Ядро Windows",
                         };
                         ui.label(egui::RichText::new(fps_hdr).font(egui::FontId::proportional(14.0)).color(egui::Color32::from_rgb(0, 235, 160)).strong());
-                        ui.add_space(6.0);
+                        ui.add_space(4.0);
 
                         let (f1, fd1) = match lang {
-                            Language::Ukrainian => ("Вимкнути GameDVR & Xbox запис у фоні (+5-15% FPS)", "Зупиняє невидимий запис екрану та мікрофризи DWM."),
-                            Language::English => ("Disable GameDVR & Background Capture (+5-15% FPS)", "Stops hidden GPU background recording & DWM stutters."),
+                            Language::Ukrainian => ("Вимкнути GameDVR & Xbox запис (+5-15% FPS)", "Зупиняє фоновий запис екрану та DWM мікрофризи."),
+                            Language::English => ("Disable GameDVR & Background Capture (+5-15% FPS)", "Stops hidden GPU recording & DWM stutters."),
                             Language::Russian => ("Отключить GameDVR и фоновую запись (+5-15% FPS)", "Останавливает невидимую запись экрана и микрофризы."),
                         };
                         ui.checkbox(&mut self.tweak_opts.tweak_fps_gamedvr, egui::RichText::new(f1).strong());
                         ui.label(egui::RichText::new(fd1).font(egui::FontId::proportional(10.5)).color(egui::Color32::GRAY));
 
                         let (f2, fd2) = match lang {
-                            Language::Ukrainian => ("PowerThrottling=Off + HAGS GPU=On + PrioritySep=0x26", "Максимальні частоти CPU/GPU для вікна гри."),
-                            Language::English => ("PowerThrottling=Off + GPU HAGS=On + PrioritySep=0x26", "Prevents Windows E-core/background CPU throttling."),
+                            Language::Ukrainian => ("PowerThrottling=Off + GPU HAGS=On + PrioritySep=0x26", "Максимальні частоти CPU/GPU для вікна гри."),
+                            Language::English => ("PowerThrottling=Off + GPU HAGS=On + PrioritySep=0x26", "Prevents E-core/background CPU throttling."),
                             Language::Russian => ("PowerThrottling=Off + HAGS GPU=On + PrioritySep=0x26", "Максимальные частоты CPU/GPU для окна игры."),
                         };
                         ui.checkbox(&mut self.tweak_opts.tweak_fps_power_throttling, egui::RichText::new(f2).strong());
                         ui.label(egui::RichText::new(fd2).font(egui::FontId::proportional(10.5)).color(egui::Color32::GRAY));
 
                         let (f3, fd3) = match lang {
-                            Language::Ukrainian => ("Win11 Global Timer Fix (GlobalTimerResolutionRequests=1)", "Дозволяє 0.5ms таймеру діяти глобально на ігри у Win11."),
+                            Language::Ukrainian => ("Win11 Global Timer Fix (GlobalTimerResolutionRequests=1)", "Поширює 0.5ms таймер на всі ігри у Windows 11."),
                             Language::English => ("Win11 Global 0.5ms Timer Fix (GlobalTimerResolutionRequests=1)", "Propagates 0.5ms timer resolution to games on Win11."),
-                            Language::Russian => ("Win11 Global Timer Fix (GlobalTimerResolutionRequests=1)", "Позволяет 0.5ms таймеру действовать на игры в Win11."),
+                            Language::Russian => ("Win11 Global Timer Fix (GlobalTimerResolutionRequests=1)", "Распространяет 0.5ms таймер на игры в Windows 11."),
                         };
                         ui.checkbox(&mut self.tweak_opts.tweak_win11_timer, egui::RichText::new(f3).strong());
                         ui.label(egui::RichText::new(fd3).font(egui::FontId::proportional(10.5)).color(egui::Color32::GRAY));
 
-                        let (f4, fd4) = match lang {
-                            Language::Ukrainian => (
-                                format!("Постійний High CPU/I-O пріоритет для {}", self.supported_games[self.selected_game].exe),
-                                "Нативний реєстр IFEO (100% безпечно для EAC / Vanguard / VAC).",
-                            ),
-                            Language::English => (
-                                format!("Persistent High CPU & I/O Priority for {}", self.supported_games[self.selected_game].exe),
-                                "Native IFEO PerfOptions (100% safe for EAC/Vanguard/VAC).",
-                            ),
-                            Language::Russian => (
-                                format!("Постоянный High CPU/I-O приоритет для {}", self.supported_games[self.selected_game].exe),
-                                "Нативный реестр IFEO (100% безопасно для EAC / Vanguard).",
-                            ),
-                        };
+                        let f4 = format!("IFEO High CPU & I/O Priority ({})", self.supported_games[self.selected_game].exe);
                         ui.checkbox(&mut self.tweak_opts.tweak_game_priority_ifeo, egui::RichText::new(f4).strong());
-                        ui.label(egui::RichText::new(fd4).font(egui::FontId::proportional(10.5)).color(egui::Color32::GRAY));
                     });
                 });
             });
 
             ui.add_space(8.0);
 
-            // Apply / Rollback Row + Log
             ui.horizontal(|ui| {
                 let apply_txt = if self.tweaks_busy {
                     "⏳ Applying...".to_string()
@@ -2338,8 +2567,8 @@ impl AppState {
                 Language::Russian => "Быстрый выбор цели:",
             };
             ui.label(pre_lbl);
-            if ui.button("Valve Frankfurt").clicked() { self.diag_host = "155.133.226.1".into(); }
             if ui.button("Valve Warsaw").clicked() { self.diag_host = "155.133.230.1".into(); }
+            if ui.button("Valve Frankfurt").clicked() { self.diag_host = "155.133.226.1".into(); }
             if ui.button("Fortnite AWS EU").clicked() { self.diag_host = "dynamodb.eu-central-1.amazonaws.com".into(); }
             if ui.button("Cloudflare 1.1.1.1").clicked() { self.diag_host = "1.1.1.1".into(); }
         });
@@ -2398,7 +2627,7 @@ impl AppState {
 fn main() -> eframe::Result<()> {
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([920.0, 645.0])
+            .with_inner_size([920.0, 650.0])
             .with_min_inner_size([860.0, 560.0])
             .with_title(APP_WINDOW_TITLE),
         ..Default::default()
@@ -2421,7 +2650,7 @@ fn main() -> eframe::Result<()> {
                 egui_ctx_adapters.request_repaint();
             });
 
-            // Background Native ICMP Relay Monitor (Every 10s, zero child process spawn)
+            // Background Native ICMP Relay Monitor
             let (node_tx, node_rx) = mpsc::channel();
             app.node_ping_rx = Some(node_rx);
             let nodes_info: Vec<(usize, String)> = app
@@ -2473,7 +2702,7 @@ fn main() -> eframe::Result<()> {
                 .ok();
 
             if let Some(tray_item) = &mut tray {
-                let _ = tray_item.add_label("⚡ WPing v2.0 • Created by Vsqy");
+                let _ = tray_item.add_label("⚡ WPing v2.1 • Created by Vsqy");
                 let _ = tray_item.add_label("───────────────");
 
                 let show_txt = match lang {

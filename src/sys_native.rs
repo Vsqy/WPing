@@ -872,3 +872,34 @@ pub fn activate_ultimate_or_high_perf() -> (bool, String) {
 
     (false, "Unavailable".to_string())
 }
+
+// ---------------- WI-FI ANTI-SCAN & NETWORK SESSION OPTIMIZATIONS ----------------
+
+pub fn flush_dns_and_arp_cache() {
+    let _ = Command::new("ipconfig")
+        .args(&["/flushdns"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .status();
+}
+
+/// Pauses Windows WLAN background SSID scanning during Boost (prevents every-60s 100ms+ Wi-Fi ping spikes).
+/// Safely ignored on Ethernet; re-enabled on Stop Boost / Exit.
+pub fn set_wifi_scan_enabled(adapter_name: &str, enable: bool) -> bool {
+    if adapter_name.is_empty() {
+        return false;
+    }
+    let state = if enable { "yes" } else { "no" };
+    Command::new("netsh")
+        .args(&[
+            "wlan",
+            "set",
+            "autoconfig",
+            &format!("enabled={}", state),
+            &format!("interface={}", adapter_name),
+        ])
+        .creation_flags(CREATE_NO_WINDOW)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
