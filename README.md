@@ -1,4 +1,4 @@
-# ⚡ WPing v2.1 — Ultimate Latency, Ping, Server Picker & FPS Optimizer
+# ⚡ WPing v2.2 — Fortnite Pro, CS2, Latency & FPS Optimizer
 > **Created by Vsqy**
 
 An ultra-fast, lightweight network routing, kernel latency, and FPS optimizer for competitive online gaming, built natively with **Rust** (~14 MB RAM, 0% CPU overhead).

@@ -32,7 +32,7 @@ echo   Created by Vsqy
 echo ========================================================
 echo.
 
-echo [*] 1. Disabling Network Throttling, Reserved Bandwidth, P2P Updates ^& Tuning MMCSS...
+echo [*] 1. Disabling Network Throttling, Reserved Bandwidth, IPv6 Stall ^& Tuning MMCSS...
 reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile" /v NetworkThrottlingIndex /t REG_DWORD /d 0xffffffff /f >nul
 reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile" /v SystemResponsiveness /t REG_DWORD /d 0 /f >nul
 reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile\Tasks\Games" /v "GPU Priority" /t REG_DWORD /d 8 /f >nul
@@ -42,6 +42,18 @@ reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProf
 reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile\Tasks\Games" /v "Latency Sensitive" /t REG_SZ /d "True" /f >nul
 reg add "HKLM\SOFTWARE\Policies\Microsoft\Windows\Psched" /v NonBestEffortLimit /t REG_DWORD /d 0 /f >nul
 reg add "HKLM\SOFTWARE\Policies\Microsoft\Windows\DeliveryOptimization" /v DODownloadMode /t REG_DWORD /d 0 /f >nul
+reg add "HKLM\SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters" /v DisabledComponents /t REG_DWORD /d 32 /f >nul
+reg add "HKLM\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters" /v MaxUserPort /t REG_DWORD /d 65534 /f >nul
+reg add "HKLM\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters" /v TcpTimedWaitDelay /t REG_DWORD /d 30 /f >nul
+reg add "HKLM\SYSTEM\CurrentControlSet\Services\Dnscache\Parameters" /v NegativeCacheTime /t REG_DWORD /d 0 /f >nul
+
+powershell -NoProfile -Command "
+Remove-NetQosPolicy -Name 'WPing_Fortnite_*' -Confirm:$false -ErrorAction SilentlyContinue;
+New-NetQosPolicy -Name 'WPing_Fortnite_Exe' -AppPathNameMatchCondition 'FortniteClient-Win64-Shipping.exe' -DSCPAction 46 -PriorityValue8021Action 6 -NetworkProfile All -ErrorAction SilentlyContinue | Out-Null;
+New-NetQosPolicy -Name 'WPing_Fortnite_UDP_Match' -IPProtocolMatchCondition UDP -IPDstPortStartMatchCondition 9000 -IPDstPortEndMatchCondition 9200 -DSCPAction 46 -PriorityValue8021Action 6 -NetworkProfile All -ErrorAction SilentlyContinue | Out-Null;
+New-NetQosPolicy -Name 'WPing_Fortnite_UDP_Beacon' -IPProtocolMatchCondition UDP -IPDstPortStartMatchCondition 15000 -IPDstPortEndMatchCondition 15200 -DSCPAction 46 -PriorityValue8021Action 6 -NetworkProfile All -ErrorAction SilentlyContinue | Out-Null;
+New-NetQosPolicy -Name 'WPing_Fortnite_UDP_QoS' -IPProtocolMatchCondition UDP -IPDstPortMatchCondition 22222 -DSCPAction 46 -PriorityValue8021Action 6 -NetworkProfile All -ErrorAction SilentlyContinue | Out-Null;
+"
 
 echo [*] 2. Disabling Nagle ^& Optimizing Winsock AFD Fast-Path...
 powershell -NoProfile -Command "

@@ -903,3 +903,208 @@ pub fn set_wifi_scan_enabled(adapter_name: &str, enable: bool) -> bool {
         .unwrap_or(false)
 }
 
+// ---------------- FORTNITE PRO ENGINE (CONFIG + TELEMETRY PARSER) ----------------
+
+#[derive(Clone, Debug, Default)]
+pub struct FortniteDiagnostics {
+    pub installed: bool,
+    pub config_path: String,
+    pub reflex_mode: i32,
+    pub low_latency_tweak1: bool,
+    pub cosmetic_streaming_disabled: bool,
+    pub eu_qos_summary: String,
+    pub last_match_server: String,
+    pub has_backup: bool,
+}
+
+fn fortnite_config_dir() -> Option<std::path::PathBuf> {
+    std::env::var_os("LOCALAPPDATA")
+        .map(|v| std::path::PathBuf::from(v).join("FortniteGame").join("Saved"))
+}
+
+pub fn inspect_fortnite_state() -> FortniteDiagnostics {
+    let mut diag = FortniteDiagnostics::default();
+    let Some(saved) = fortnite_config_dir() else {
+        return diag;
+    };
+
+    let cfg_path = saved
+        .join("Config")
+        .join("WindowsClient")
+        .join("GameUserSettings.ini");
+    let bak_path = saved
+        .join("Config")
+        .join("WindowsClient")
+        .join("GameUserSettings.ini.wping.bak");
+    diag.has_backup = bak_path.exists();
+
+    if cfg_path.exists() {
+        diag.installed = true;
+        diag.config_path = cfg_path.to_string_lossy().to_string();
+        if let Ok(content) = std::fs::read_to_string(&cfg_path) {
+            for line in content.lines() {
+                let l = line.trim();
+                if let Some(val) = l.strip_prefix("LatencyTweak2=") {
+                    diag.reflex_mode = val.trim().parse().unwrap_or(0);
+                } else if let Some(val) = l.strip_prefix("bLatencyTweak1=") {
+                    diag.low_latency_tweak1 = val.trim().eq_ignore_ascii_case("True");
+                } else if let Some(val) = l.strip_prefix("bDisableCosmeticStreaming=") {
+                    if val.trim().eq_ignore_ascii_case("True") {
+                        diag.cosmetic_streaming_disabled = true;
+                    }
+                } else if let Some(val) = l.strip_prefix("CosmeticStreamingEnabled=") {
+                    if val.trim().contains("Disabled") {
+                        diag.cosmetic_streaming_disabled = true;
+                    }
+                }
+            }
+        }
+    }
+
+    // Parse FortniteGame.log for real QoS datacenter pings (DE / GB / FR) & last match server IP
+    let log_path = saved.join("Logs").join("FortniteGame.log");
+    if let Ok(log_bytes) = std::fs::read(&log_path) {
+        let log_str = String::from_utf8_lossy(&log_bytes);
+        let mut de_p = String::new();
+        let mut gb_p = String::new();
+        let mut fr_p = String::new();
+        let mut last_srv = String::new();
+        let mut last_sub = String::new();
+
+        for line in log_str.lines() {
+            if line.contains("DE (EU):") {
+                if let Some(pos) = line.find("average ping:") {
+                    de_p = line[pos + 13..].split_whitespace().next().unwrap_or("").trim_end_matches(';').to_string();
+                }
+            } else if line.contains("GB (EU):") {
+                if let Some(pos) = line.find("average ping:") {
+                    gb_p = line[pos + 13..].split_whitespace().next().unwrap_or("").trim_end_matches(';').to_string();
+                }
+            } else if line.contains("FR (EU):") {
+                if let Some(pos) = line.find("average ping:") {
+                    fr_p = line[pos + 13..].split_whitespace().next().unwrap_or("").trim_end_matches(';').to_string();
+                }
+            } else if line.contains("SubRegion:") {
+                if let Some(pos) = line.find("SubRegion:") {
+                    last_sub = line[pos + 10..].split(',').next().unwrap_or("").trim().to_string();
+                }
+            } else if line.contains("LogNet: Browse:") && line.contains("/Game/Maps/Frontend") && line.contains(':') {
+                if let Some(pos) = line.find("Browse:") {
+                    let rest = line[pos + 7..].trim();
+                    if let Some(slash) = rest.find('/') {
+                        let host_port = &rest[..slash];
+                        if host_port.chars().next().map_or(false, |c| c.is_ascii_digit()) {
+                            last_srv = host_port.to_string();
+                        }
+                    }
+                }
+            }
+        }
+
+        if !de_p.is_empty() || !gb_p.is_empty() || !fr_p.is_empty() {
+            diag.eu_qos_summary = format!("DE (Frankfurt): {} | GB (London): {} | FR (Paris): {}", de_p, gb_p, fr_p);
+        }
+        if !last_srv.is_empty() {
+            diag.last_match_server = if last_sub.is_empty() {
+                last_srv
+            } else {
+                format!("{} (EU SubRegion: {})", last_srv, last_sub)
+            };
+        }
+    }
+
+    diag
+}
+
+fn upsert_ini_key(lines: &mut Vec<String>, section: &str, key: &str, value: &str) {
+    let prefix = format!("{}=", key);
+    let mut in_section = false;
+    let mut section_end_idx = None;
+
+    for (i, line) in lines.iter_mut().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            if in_section {
+                section_end_idx = Some(i);
+                break;
+            }
+            in_section = trimmed.eq_ignore_ascii_case(section);
+        } else if in_section && trimmed.starts_with(&prefix) {
+            *line = format!("{}={}", key, value);
+            return;
+        }
+    }
+
+    let new_line = format!("{}={}", key, value);
+    if let Some(idx) = section_end_idx {
+        lines.insert(idx, new_line);
+    } else if in_section {
+        lines.push(new_line);
+    } else {
+        lines.push(section.to_string());
+        lines.push(new_line);
+    }
+}
+
+/// Applies competitive latency & FPS settings to Fortnite GameUserSettings.ini (backing up first).
+pub fn optimize_fortnite_config() -> Result<String, String> {
+    let Some(saved) = fortnite_config_dir() else {
+        return Err("LOCALAPPDATA not found".into());
+    };
+    let cfg_path = saved
+        .join("Config")
+        .join("WindowsClient")
+        .join("GameUserSettings.ini");
+    if !cfg_path.exists() {
+        return Err("Fortnite GameUserSettings.ini not found".into());
+    }
+
+    let bak_path = saved
+        .join("Config")
+        .join("WindowsClient")
+        .join("GameUserSettings.ini.wping.bak");
+    if !bak_path.exists() {
+        let _ = std::fs::copy(&cfg_path, &bak_path);
+    }
+
+    let raw = std::fs::read_to_string(&cfg_path).map_err(|e| format!("Read error: {}", e))?;
+    let mut lines: Vec<String> = raw.lines().map(|l| l.to_string()).collect();
+
+    let sec = "[/Script/FortniteGame.FortGameUserSettings]";
+    upsert_ini_key(&mut lines, sec, "LatencyTweak2", "2");
+    upsert_ini_key(&mut lines, sec, "bLatencyTweak1", "True");
+    upsert_ini_key(&mut lines, sec, "bDisableCosmeticStreaming", "True");
+    upsert_ini_key(&mut lines, sec, "CosmeticStreamingEnabled", "CodeSet_Disabled");
+    upsert_ini_key(&mut lines, sec, "bAllowDownloadHighResMips", "False");
+    upsert_ini_key(&mut lines, sec, "bMotionBlur", "False");
+    upsert_ini_key(&mut lines, sec, "bShowGrass", "False");
+    upsert_ini_key(&mut lines, sec, "bUseVSync", "False");
+    upsert_ini_key(&mut lines, sec, "bUseDynamicResolution", "False");
+    upsert_ini_key(&mut lines, sec, "bUseGPUCrashDebugging", "False");
+
+    let out = lines.join("\r\n") + "\r\n";
+    std::fs::write(&cfg_path, out.as_bytes()).map_err(|e| format!("Write error: {}", e))?;
+
+    Ok("Reflex=On+Boost, LowLatency=True, CosmeticStreaming=Off, MotionBlur/Grass/VSync=Off".into())
+}
+
+pub fn restore_fortnite_config() -> Result<String, String> {
+    let Some(saved) = fortnite_config_dir() else {
+        return Err("LOCALAPPDATA not found".into());
+    };
+    let cfg_path = saved
+        .join("Config")
+        .join("WindowsClient")
+        .join("GameUserSettings.ini");
+    let bak_path = saved
+        .join("Config")
+        .join("WindowsClient")
+        .join("GameUserSettings.ini.wping.bak");
+    if !bak_path.exists() {
+        return Err("Backup not found".into());
+    }
+    std::fs::copy(&bak_path, &cfg_path).map_err(|e| format!("Restore error: {}", e))?;
+    Ok("Restored original Fortnite GameUserSettings.ini".into())
+}
+
+

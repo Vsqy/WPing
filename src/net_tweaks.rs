@@ -45,6 +45,7 @@ pub struct NetworkHealthReport {
     pub interface_metric: u32,
     pub giga_lite_enabled: bool,
     pub global_timer_win11: u32,
+    pub ipv4_preferred: bool,
     pub issue_count: usize,
 }
 
@@ -328,7 +329,9 @@ pub fn audit_network_health(adapter_name: &str) -> NetworkHealthReport {
          $dns = ((Get-DnsClientServerAddress -InterfaceAlias '{}' -AddressFamily IPv4).ServerAddresses) -join ','\r\n\
          $krn = (Get-ItemProperty 'HKLM:\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\kernel' -Name GlobalTimerResolutionRequests).GlobalTimerResolutionRequests\r\n\
          $gt = if ($null -ne $krn) {{ [int]$krn }} else {{ 0 }}\r\n\
-         Write-Output \"$mtu|$jumbo|$rsc|$pcf|$ackTimeout|$ackFreq|$cong|$ignPush|$dns|$automet|$metric|$giga|$gt\"\r\n",
+         $v6 = (Get-ItemProperty 'HKLM:\\SYSTEM\\CurrentControlSet\\Services\\Tcpip6\\Parameters' -Name DisabledComponents).DisabledComponents\r\n\
+         $v4pref = if ($null -ne $v6 -and ([int]$v6 -band 32) -eq 32) {{ 1 }} else {{ 0 }}\r\n\
+         Write-Output \"$mtu|$jumbo|$rsc|$pcf|$ackTimeout|$ackFreq|$cong|$ignPush|$dns|$automet|$metric|$giga|$gt|$v4pref\"\r\n",
         a, a, a, a
     );
 
@@ -340,7 +343,7 @@ pub fn audit_network_health(adapter_name: &str) -> NetworkHealthReport {
     if let Ok(o) = out {
         let line = String::from_utf8_lossy(&o.stdout).trim().to_string();
         let parts: Vec<&str> = line.split('|').collect();
-        if parts.len() >= 13 {
+        if parts.len() >= 14 {
             rep.loaded = true;
             rep.adapter_mtu = parts[0].parse().unwrap_or(1500);
             rep.jumbo_value = parts[1].to_string();
@@ -355,6 +358,7 @@ pub fn audit_network_health(adapter_name: &str) -> NetworkHealthReport {
             rep.interface_metric = parts[10].parse().unwrap_or(25);
             rep.giga_lite_enabled = parts[11] == "1";
             rep.global_timer_win11 = parts[12].parse().unwrap_or(0);
+            rep.ipv4_preferred = parts[13] == "1";
 
             let mut issues = 0;
             if rep.adapter_mtu > 1500 { issues += 1; }
@@ -366,6 +370,7 @@ pub fn audit_network_health(adapter_name: &str) -> NetworkHealthReport {
             if rep.auto_metric || rep.interface_metric > 10 { issues += 1; }
             if rep.giga_lite_enabled { issues += 1; }
             if rep.global_timer_win11 != 1 { issues += 1; }
+            if !rep.ipv4_preferred { issues += 1; }
             rep.issue_count = issues;
         }
     }
@@ -559,12 +564,16 @@ pub fn apply_selected_tweaks(opts: &TweakOptions, adapter_name: &str, game_exe: 
              reg add 'HKLM\\SYSTEM\\CurrentControlSet\\Services\\AFD\\Parameters' /v FastSendDatagramThreshold /t REG_DWORD /d 16384 /f | Out-Null\r\n\
              reg add 'HKLM\\SYSTEM\\CurrentControlSet\\Services\\AFD\\Parameters' /v FastCopyReceiveThreshold /t REG_DWORD /d 16384 /f | Out-Null\r\n\
              reg add 'HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\DeliveryOptimization' /v DODownloadMode /t REG_DWORD /d 0 /f | Out-Null\r\n\
+             reg add 'HKLM\\SYSTEM\\CurrentControlSet\\Services\\Tcpip6\\Parameters' /v DisabledComponents /t REG_DWORD /d 32 /f | Out-Null\r\n\
+             reg add 'HKLM\\SYSTEM\\CurrentControlSet\\Services\\Tcpip\\Parameters' /v MaxUserPort /t REG_DWORD /d 65534 /f | Out-Null\r\n\
+             reg add 'HKLM\\SYSTEM\\CurrentControlSet\\Services\\Tcpip\\Parameters' /v TcpTimedWaitDelay /t REG_DWORD /d 30 /f | Out-Null\r\n\
+             reg add 'HKLM\\SYSTEM\\CurrentControlSet\\Services\\Dnscache\\Parameters' /v NegativeCacheTime /t REG_DWORD /d 0 /f | Out-Null\r\n\
              if ('{}' -ne '') {{\r\n\
                  $jp = Get-NetAdapterAdvancedProperty -Name '{}' -RegistryKeyword '*JumboPacket' -ErrorAction SilentlyContinue\r\n\
                  if ($jp -and $jp.DefaultRegistryValue) {{ Set-NetAdapterAdvancedProperty -Name '{}' -RegistryKeyword '*JumboPacket' -RegistryValue $jp.DefaultRegistryValue -ErrorAction SilentlyContinue }}\r\n\
                  netsh interface ipv4 set subinterface \"{}\" mtu=1500 store=persistent | Out-Null\r\n\
              }}\r\n\
-             Log '✔ Winsock AFD Fast-Path Tuned, P2P Update Seeding Off, Jumbo Off & Clean MTU=1500'\r\n",
+             Log '✔ Winsock AFD Fast-Path, IPv4-First (No IPv6 Stall), Jumbo Off & Clean MTU=1500'\r\n",
             a, a, a, safe_name
         ));
     }
@@ -586,10 +595,18 @@ pub fn apply_selected_tweaks(opts: &TweakOptions, adapter_name: &str, game_exe: 
         ps.push_str(&format!(
             "reg add 'HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\Psched' /v NonBestEffortLimit /t REG_DWORD /d 0 /f | Out-Null\r\n\
              Remove-NetQosPolicy -Name 'WPing_Game_QoS' -Confirm:$false -ErrorAction SilentlyContinue\r\n\
+             Remove-NetQosPolicy -Name 'WPing_Fortnite_Exe' -Confirm:$false -ErrorAction SilentlyContinue\r\n\
+             Remove-NetQosPolicy -Name 'WPing_Fortnite_UDP_Match' -Confirm:$false -ErrorAction SilentlyContinue\r\n\
+             Remove-NetQosPolicy -Name 'WPing_Fortnite_UDP_Beacon' -Confirm:$false -ErrorAction SilentlyContinue\r\n\
+             Remove-NetQosPolicy -Name 'WPing_Fortnite_UDP_QoS' -Confirm:$false -ErrorAction SilentlyContinue\r\n\
              if ('{}' -ne '') {{\r\n\
                  New-NetQosPolicy -Name 'WPing_Game_QoS' -AppPathNameMatchCondition '{}' -DSCPAction 46 -PriorityValue8021Action 6 -NetworkProfile All | Out-Null\r\n\
              }}\r\n\
-             Log '✔ QoS DSCP 46 (EF) Active & 20% Bandwidth Limit Removed'\r\n",
+             New-NetQosPolicy -Name 'WPing_Fortnite_Exe' -AppPathNameMatchCondition 'FortniteClient-Win64-Shipping.exe' -DSCPAction 46 -PriorityValue8021Action 6 -NetworkProfile All | Out-Null\r\n\
+             New-NetQosPolicy -Name 'WPing_Fortnite_UDP_Match' -IPProtocolMatchCondition UDP -IPDstPortStartMatchCondition 9000 -IPDstPortEndMatchCondition 9200 -DSCPAction 46 -PriorityValue8021Action 6 -NetworkProfile All | Out-Null\r\n\
+             New-NetQosPolicy -Name 'WPing_Fortnite_UDP_Beacon' -IPProtocolMatchCondition UDP -IPDstPortStartMatchCondition 15000 -IPDstPortEndMatchCondition 15200 -DSCPAction 46 -PriorityValue8021Action 6 -NetworkProfile All | Out-Null\r\n\
+             New-NetQosPolicy -Name 'WPing_Fortnite_UDP_QoS' -IPProtocolMatchCondition UDP -IPDstPortMatchCondition 22222 -DSCPAction 46 -PriorityValue8021Action 6 -NetworkProfile All | Out-Null\r\n\
+             Log '✔ QoS DSCP 46 (EF) Active for Game + Fortnite UDP Match/Beacon/QoS Ports (9000-9200, 15000-15200, 22222)'\r\n",
             g, g
         ));
     }
@@ -699,7 +716,12 @@ pub fn rollback_default_tweaks(adapter_name: &str, game_exe: &str, is_admin: boo
          reg add 'HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Multimedia\\SystemProfile' /v SystemResponsiveness /t REG_DWORD /d 20 /f | Out-Null\r\n\
          reg delete 'HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\Psched' /v NonBestEffortLimit /f 2>$null | Out-Null\r\n\
          reg delete 'HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\DeliveryOptimization' /v DODownloadMode /f 2>$null | Out-Null\r\n\
+         reg delete 'HKLM\\SYSTEM\\CurrentControlSet\\Services\\Tcpip6\\Parameters' /v DisabledComponents /f 2>$null | Out-Null\r\n\
          Remove-NetQosPolicy -Name 'WPing_Game_QoS' -Confirm:$false -ErrorAction SilentlyContinue\r\n\
+         Remove-NetQosPolicy -Name 'WPing_Fortnite_Exe' -Confirm:$false -ErrorAction SilentlyContinue\r\n\
+         Remove-NetQosPolicy -Name 'WPing_Fortnite_UDP_Match' -Confirm:$false -ErrorAction SilentlyContinue\r\n\
+         Remove-NetQosPolicy -Name 'WPing_Fortnite_UDP_Beacon' -Confirm:$false -ErrorAction SilentlyContinue\r\n\
+         Remove-NetQosPolicy -Name 'WPing_Fortnite_UDP_QoS' -Confirm:$false -ErrorAction SilentlyContinue\r\n\
          Remove-NetFirewallRule -Group 'WPing_ServerBlock' -ErrorAction SilentlyContinue\r\n\
          if ('{}' -ne '') {{\r\n\
              Set-NetIPInterface -InterfaceAlias '{}' -AutomaticMetric Enabled -ErrorAction SilentlyContinue\r\n\

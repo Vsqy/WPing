@@ -20,14 +20,15 @@ use sys_native::{
     activate_power_plan, activate_ultimate_or_high_perf, apply_filterkeys,
     balance_processes_for_gaming, clean_ram_and_standby, disable_05ms_timer, disable_filterkeys,
     discover_optimal_mtu, enable_05ms_timer, flush_dns_and_arp_cache, get_active_power_plan,
-    is_mouse_accel_enabled, is_user_admin, native_icmp_ping, query_filterkeys, query_memory_stats,
-    query_timer_resolution, resolve_ipv4, restart_as_admin, restore_balanced_processes,
-    scan_for_games, set_mouse_accel, set_wifi_scan_enabled, DetectedGame, GameDefinition,
-    IcmpProber, MemoryStats,
+    inspect_fortnite_state, is_mouse_accel_enabled, is_user_admin, native_icmp_ping,
+    optimize_fortnite_config, query_filterkeys, query_memory_stats, query_timer_resolution,
+    resolve_ipv4, restart_as_admin, restore_balanced_processes, restore_fortnite_config,
+    scan_for_games, set_mouse_accel, set_wifi_scan_enabled, DetectedGame, FortniteDiagnostics,
+    GameDefinition, IcmpProber, MemoryStats,
 };
 use tray_item::{IconSource, TrayItem};
 
-const APP_WINDOW_TITLE: &str = "WPing v2.1 - Ultimate Ping, FPS & Input Optimizer";
+const APP_WINDOW_TITLE: &str = "WPing v2.2 - Fortnite, Ping, FPS & Input Optimizer";
 static MAIN_HWND: AtomicIsize = AtomicIsize::new(0);
 
 #[derive(PartialEq, Clone, Copy, Debug)]
@@ -208,6 +209,10 @@ struct AppState {
     ram_clean_status: String,
     last_metrics_poll: Instant,
 
+    // Fortnite Pro Telemetry & Config
+    fn_diag: FortniteDiagnostics,
+    fn_status_msg: String,
+
     // Async Receivers
     detect_rx: Option<mpsc::Receiver<Option<DetectedGame>>>,
     adapters_rx: Option<mpsc::Receiver<Vec<NetworkAdapter>>>,
@@ -227,36 +232,36 @@ impl Default for AppState {
         }
 
         let supported_games = vec![
-            GameDefinition { name: "Counter-Strike 2", exe: "cs2.exe", server_idx: 0 },
-            GameDefinition { name: "Fortnite", exe: "FortniteClient-Win64-Shipping.exe", server_idx: 3 },
+            GameDefinition { name: "Fortnite", exe: "FortniteClient-Win64-Shipping.exe", server_idx: 0 },
+            GameDefinition { name: "Counter-Strike 2", exe: "cs2.exe", server_idx: 6 },
             GameDefinition { name: "Valorant", exe: "VALORANT-Win64-Shipping.exe", server_idx: 1 },
-            GameDefinition { name: "Dota 2", exe: "dota2.exe", server_idx: 2 },
+            GameDefinition { name: "Dota 2", exe: "dota2.exe", server_idx: 6 },
             GameDefinition { name: "Apex Legends", exe: "r5apex.exe", server_idx: 1 },
             GameDefinition { name: "PUBG: BATTLEGROUNDS", exe: "TslGame.exe", server_idx: 1 },
             GameDefinition { name: "League of Legends", exe: "League of Legends.exe", server_idx: 1 },
             GameDefinition { name: "Overwatch 2", exe: "Overwatch.exe", server_idx: 1 },
-            GameDefinition { name: "Deadlock", exe: "project8.exe", server_idx: 1 },
-            GameDefinition { name: "Escape from Tarkov", exe: "EscapeFromTarkov.exe", server_idx: 0 },
+            GameDefinition { name: "Deadlock", exe: "project8.exe", server_idx: 6 },
+            GameDefinition { name: "Escape from Tarkov", exe: "EscapeFromTarkov.exe", server_idx: 6 },
             GameDefinition { name: "Rust", exe: "RustClient.exe", server_idx: 1 },
             GameDefinition { name: "Rainbow Six Siege", exe: "RainbowSix.exe", server_idx: 1 },
             GameDefinition { name: "Call of Duty: Warzone", exe: "cod.exe", server_idx: 1 },
             GameDefinition { name: "Grand Theft Auto V", exe: "GTA5.exe", server_idx: 1 },
-            GameDefinition { name: "Rocket League", exe: "RocketLeague.exe", server_idx: 3 },
+            GameDefinition { name: "Rocket League", exe: "RocketLeague.exe", server_idx: 1 },
             GameDefinition { name: "Marvel Rivals", exe: "Marvel-Win64-Shipping.exe", server_idx: 1 },
             GameDefinition { name: "The Finals", exe: "Discovery.exe", server_idx: 1 },
-            GameDefinition { name: "Minecraft", exe: "javaw.exe", server_idx: 5 },
-            GameDefinition { name: "Roblox", exe: "RobloxPlayerBeta.exe", server_idx: 5 },
+            GameDefinition { name: "Minecraft", exe: "javaw.exe", server_idx: 7 },
+            GameDefinition { name: "Roblox", exe: "RobloxPlayerBeta.exe", server_idx: 7 },
         ];
 
         let initial_logs = match lang {
             Language::Ukrainian => vec![
-                "WPing v2.1 готовий. Виконується перевірка мережевого стека...".into(),
+                "WPing v2.2 готовий. Сканування мережевого стека та Fortnite...".into(),
             ],
             Language::English => vec![
-                "WPing v2.1 ready. Scanning Windows network stack for bottlenecks...".into(),
+                "WPing v2.2 ready. Scanning network stack & Fortnite telemetry...".into(),
             ],
             Language::Russian => vec![
-                "WPing v2.1 готов. Выполняется проверка сетевого стека...".into(),
+                "WPing v2.2 готов. Сканирование сетевого стека и Fortnite...".into(),
             ],
         };
 
@@ -315,6 +320,54 @@ impl Default for AppState {
 
             nodes: vec![
                 ServerNode {
+                    name: "Fortnite Live EU Server",
+                    loc_ua: "Fortnite DE (Франкфурт) 🎮",
+                    loc_en: "Fortnite DE (Frankfurt) 🎮",
+                    loc_ru: "Fortnite DE (Франкфурт) 🎮",
+                    host: "18.157.3.179",
+                    ping_ms: None,
+                },
+                ServerNode {
+                    name: "Fortnite / AWS Central",
+                    loc_ua: "AWS Франкфурт (DE) 🇩🇪",
+                    loc_en: "AWS Frankfurt (DE) 🇩🇪",
+                    loc_ru: "AWS Франкфурт (DE) 🇩🇪",
+                    host: "dynamodb.eu-central-1.amazonaws.com",
+                    ping_ms: None,
+                },
+                ServerNode {
+                    name: "AWS Global Accelerator",
+                    loc_ua: "AWS Edge (Найшвидший) ⚡",
+                    loc_en: "AWS Edge (Nearest) ⚡",
+                    loc_ru: "AWS Edge (Ближайший) ⚡",
+                    host: "13.248.158.1",
+                    ping_ms: None,
+                },
+                ServerNode {
+                    name: "Fortnite / AWS North",
+                    loc_ua: "AWS Стокгольм 🇸🇪",
+                    loc_en: "AWS Stockholm 🇸🇪",
+                    loc_ru: "AWS Стокгольм 🇸🇪",
+                    host: "dynamodb.eu-north-1.amazonaws.com",
+                    ping_ms: None,
+                },
+                ServerNode {
+                    name: "Fortnite / AWS West",
+                    loc_ua: "AWS Лондон (GB) 🇬🇧",
+                    loc_en: "AWS London (GB) 🇬🇧",
+                    loc_ru: "AWS Лондон (GB) 🇬🇧",
+                    host: "dynamodb.eu-west-2.amazonaws.com",
+                    ping_ms: None,
+                },
+                ServerNode {
+                    name: "Fortnite / AWS France",
+                    loc_ua: "AWS Париж (FR) 🇫🇷",
+                    loc_en: "AWS Paris (FR) 🇫🇷",
+                    loc_ru: "AWS Париж (FR) 🇫🇷",
+                    host: "dynamodb.eu-west-3.amazonaws.com",
+                    ping_ms: None,
+                },
+                ServerNode {
                     name: "Valve Game Relay",
                     loc_ua: "Варшава (EU East) 🇵🇱",
                     loc_en: "Warsaw (EU East) 🇵🇱",
@@ -323,59 +376,11 @@ impl Default for AppState {
                     ping_ms: None,
                 },
                 ServerNode {
-                    name: "Valve Game Relay",
-                    loc_ua: "Франкфурт (EU Central) 🇩🇪",
-                    loc_en: "Frankfurt (EU Central) 🇩🇪",
-                    loc_ru: "Франкфурт (EU Central) 🇩🇪",
-                    host: "155.133.226.1",
-                    ping_ms: None,
-                },
-                ServerNode {
-                    name: "Valve Game Relay",
-                    loc_ua: "Відень (Austria) 🇦🇹",
-                    loc_en: "Vienna (Austria) 🇦🇹",
-                    loc_ru: "Вена (Austria) 🇦🇹",
-                    host: "155.133.248.1",
-                    ping_ms: None,
-                },
-                ServerNode {
-                    name: "Fortnite / AWS EU",
-                    loc_ua: "Франкфурт (AWS Central) 🇩🇪",
-                    loc_en: "Frankfurt (AWS Central) 🇩🇪",
-                    loc_ru: "Франкфурт (AWS Central) 🇩🇪",
-                    host: "dynamodb.eu-central-1.amazonaws.com",
-                    ping_ms: None,
-                },
-                ServerNode {
-                    name: "Fortnite / AWS EU",
-                    loc_ua: "Лондон (AWS West) 🇬🇧",
-                    loc_en: "London (AWS West) 🇬🇧",
-                    loc_ru: "Лондон (AWS West) 🇬🇧",
-                    host: "dynamodb.eu-west-2.amazonaws.com",
-                    ping_ms: None,
-                },
-                ServerNode {
                     name: "Cloudflare Anycast",
-                    loc_ua: "Найближчий Edge (Anycast) ⚡",
-                    loc_en: "Nearest Edge (Anycast) ⚡",
-                    loc_ru: "Ближайший Edge (Anycast) ⚡",
+                    loc_ua: "Cloudflare Edge ⚡",
+                    loc_en: "Cloudflare Edge ⚡",
+                    loc_ru: "Cloudflare Edge ⚡",
                     host: "1.1.1.1",
-                    ping_ms: None,
-                },
-                ServerNode {
-                    name: "AWS Global Accelerator",
-                    loc_ua: "Європа Global Gaming 🌐",
-                    loc_en: "Europe Global Gaming 🌐",
-                    loc_ru: "Европа Global Gaming 🌐",
-                    host: "13.248.158.1",
-                    ping_ms: None,
-                },
-                ServerNode {
-                    name: "Valve Game Relay",
-                    loc_ua: "Стокгольм (EU North) 🇸🇪",
-                    loc_en: "Stockholm (EU North) 🇸🇪",
-                    loc_ru: "Стокгольм (EU North) 🇸🇪",
-                    host: "162.254.197.1",
                     ping_ms: None,
                 },
             ],
@@ -384,7 +389,7 @@ impl Default for AppState {
             last_node_update: Instant::now(),
             node_ping_rx: None,
 
-            diag_host: "155.133.230.1".into(),
+            diag_host: "18.157.3.179".into(),
             diag_results: vec![],
             is_pinging: false,
             diag_rx: None,
@@ -411,6 +416,9 @@ impl Default for AppState {
             mem_stats: query_memory_stats(),
             ram_clean_status: String::new(),
             last_metrics_poll: Instant::now(),
+
+            fn_diag: inspect_fortnite_state(),
+            fn_status_msg: String::new(),
 
             detect_rx: None,
             adapters_rx: None,
@@ -1138,7 +1146,7 @@ impl eframe::App for AppState {
                         .strong(),
                 );
                 ui.label(
-                    egui::RichText::new("v2.1")
+                    egui::RichText::new("v2.2")
                         .font(egui::FontId::proportional(12.0))
                         .color(egui::Color32::from_rgb(0, 200, 255))
                         .strong(),
@@ -1287,7 +1295,7 @@ impl eframe::App for AppState {
                 };
 
                 let timer_ms = self.timer_res_current_100ns as f32 / 10000.0;
-                let bot_label = format!("WPing v2.1 • {} • Timer: {:.3}ms", adapter_summary, timer_ms);
+                let bot_label = format!("WPing v2.2 • {} • Timer: {:.3}ms", adapter_summary, timer_ms);
                 ui.label(egui::RichText::new(bot_label).font(egui::FontId::proportional(11.0)).color(egui::Color32::from_rgb(120, 138, 158)));
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1499,6 +1507,9 @@ impl AppState {
                             if self.health.global_timer_win11 != 1 {
                                 issues.push("Win11 GlobalTimer=0".into());
                             }
+                            if !self.health.ipv4_preferred {
+                                issues.push("IPv6 Stall".into());
+                            }
 
                             let summary = issues.join(" • ");
                             let lbl = match lang {
@@ -1552,6 +1563,41 @@ impl AppState {
         }
 
         self.render_adapter_selector(ui);
+
+        // Quick Fortnite Pro Optimizer bar if Fortnite is installed and Reflex is OFF
+        if self.fn_diag.installed && self.fn_diag.reflex_mode < 2 {
+            ui.add_space(4.0);
+            egui::Frame::none()
+                .fill(egui::Color32::from_rgb(20, 32, 48))
+                .rounding(6.0)
+                .inner_margin(7.0)
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        let fn_msg = match lang {
+                            Language::Ukrainian => "🎮 Fortnite: NVIDIA Reflex ВИМКНЕНО (LatencyTweak2=0) — увімкніть On+Boost (-15ms лаг)!",
+                            Language::English => "🎮 Fortnite: NVIDIA Reflex is OFF (LatencyTweak2=0) — enable On+Boost!",
+                            Language::Russian => "🎮 Fortnite: NVIDIA Reflex ВЫКЛЮЧЕН (LatencyTweak2=0) — включите On+Boost!",
+                        };
+                        ui.label(egui::RichText::new(fn_msg).font(egui::FontId::proportional(11.5)).color(egui::Color32::from_rgb(0, 220, 255)).strong());
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let btxt = match lang {
+                                Language::Ukrainian => "⚡ ОПТИМІЗУВАТИ FORTNITE",
+                                Language::English => "⚡ OPTIMIZE FORTNITE",
+                                Language::Russian => "⚡ ОПТИМИЗИРОВАТЬ FORTNITE",
+                            };
+                            if ui.add(egui::Button::new(egui::RichText::new(btxt).font(egui::FontId::proportional(11.5)).color(egui::Color32::BLACK).strong()).fill(egui::Color32::from_rgb(0, 235, 160))).clicked() {
+                                match optimize_fortnite_config() {
+                                    Ok(msg) => {
+                                        self.fn_status_msg = msg;
+                                        self.fn_diag = inspect_fortnite_state();
+                                    }
+                                    Err(e) => self.fn_status_msg = e,
+                                }
+                            }
+                        });
+                    });
+                });
+        }
         ui.add_space(6.0);
 
         ui.horizontal(|ui| {
@@ -2118,6 +2164,112 @@ impl AppState {
                     });
                 });
             });
+
+            ui.add_space(8.0);
+
+            // FORTNITE PRO ENGINE CARD
+            ui.group(|ui| {
+                ui.set_width(874.0);
+                ui.horizontal(|ui| {
+                    let fn_hdr = match lang {
+                        Language::Ukrainian => "🎮 FORTNITE PRO (NVIDIA Reflex On+Boost, Cosmetic Streaming, EU Сервери)",
+                        Language::English => "🎮 FORTNITE PRO (NVIDIA Reflex On+Boost, Cosmetic Streaming & EU Telemetry)",
+                        Language::Russian => "🎮 FORTNITE PRO (NVIDIA Reflex On+Boost, Cosmetic Streaming, EU Серверы)",
+                    };
+                    ui.label(egui::RichText::new(fn_hdr).font(egui::FontId::proportional(14.0)).color(egui::Color32::from_rgb(0, 235, 160)).strong());
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.small_button("🔄").clicked() {
+                            self.fn_diag = inspect_fortnite_state();
+                        }
+                    });
+                });
+                ui.add_space(4.0);
+
+                if !self.fn_diag.installed {
+                    let not_found = match lang {
+                        Language::Ukrainian => "Конфіг Fortnite (GameUserSettings.ini) не знайдено на цьому ПК. UDP QoS (9000-9200 / 22222) доступний у вкладці 'Твіки Windows'.",
+                        Language::English => "Fortnite GameUserSettings.ini not found on this PC. Fortnite UDP QoS (9000-9200 / 22222) is still available in 'Windows Tweaks'.",
+                        Language::Russian => "Конфиг Fortnite (GameUserSettings.ini) не найден на этом ПК. UDP QoS (9000-9200 / 22222) доступен во вкладке 'Твики Windows'.",
+                    };
+                    ui.label(egui::RichText::new(not_found).font(egui::FontId::proportional(11.5)).color(egui::Color32::GRAY));
+                } else {
+                    let reflex_lbl = match self.fn_diag.reflex_mode {
+                        2 => "ON + BOOST ✔",
+                        1 => "ON (No Boost)",
+                        _ => "OFF ⚠️",
+                    };
+                    let stream_lbl = if self.fn_diag.cosmetic_streaming_disabled {
+                        "Disabled (No Skin Lag) ✔"
+                    } else {
+                        "Enabled ⚠️"
+                    };
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "NVIDIA Reflex: {}  |  LowLatency1: {}  |  Cosmetic Streaming: {}",
+                            reflex_lbl,
+                            if self.fn_diag.low_latency_tweak1 { "True ✔" } else { "False ⚠️" },
+                            stream_lbl
+                        ))
+                        .font(egui::FontId::proportional(11.5))
+                        .color(egui::Color32::from_rgb(200, 225, 245))
+                        .strong(),
+                    );
+
+                    if !self.fn_diag.eu_qos_summary.is_empty() {
+                        ui.label(
+                            egui::RichText::new(format!("📡 Fortnite Log QoS: {}", self.fn_diag.eu_qos_summary))
+                                .font(egui::FontId::proportional(11.0))
+                                .color(egui::Color32::from_rgb(0, 210, 255)),
+                        );
+                    }
+                    if !self.fn_diag.last_match_server.is_empty() {
+                        ui.label(
+                            egui::RichText::new(format!("🌍 Останній сервер матчу: {}", self.fn_diag.last_match_server))
+                                .font(egui::FontId::proportional(11.0))
+                                .color(egui::Color32::from_rgb(160, 180, 200)),
+                        );
+                    }
+
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        let opt_btn_txt = match lang {
+                            Language::Ukrainian => "⚡ ОПТИМІЗУВАТИ FORTNITE (REFLEX ON+BOOST + БЕЗ ЛАГІВ)",
+                            Language::English => "⚡ OPTIMIZE FORTNITE CONFIG (REFLEX ON+BOOST + FPS)",
+                            Language::Russian => "⚡ ОПТИМИЗИРОВАТЬ FORTNITE (REFLEX ON+BOOST + БЕЗ ЛАГОВ)",
+                        };
+                        if ui.add(egui::Button::new(egui::RichText::new(opt_btn_txt).color(egui::Color32::BLACK).strong()).fill(egui::Color32::from_rgb(0, 235, 160))).clicked() {
+                            match optimize_fortnite_config() {
+                                Ok(msg) => {
+                                    self.fn_status_msg = format!("✔ {}", msg);
+                                    self.fn_diag = inspect_fortnite_state();
+                                }
+                                Err(e) => self.fn_status_msg = format!("✖ {}", e),
+                            }
+                        }
+
+                        if self.fn_diag.has_backup {
+                            let rest_txt = match lang {
+                                Language::Ukrainian => "↩ Відновити бекап",
+                                Language::English => "↩ Restore Backup",
+                                Language::Russian => "↩ Восстановить бекап",
+                            };
+                            if ui.button(rest_txt).clicked() {
+                                match restore_fortnite_config() {
+                                    Ok(msg) => {
+                                        self.fn_status_msg = format!("✔ {}", msg);
+                                        self.fn_diag = inspect_fortnite_state();
+                                    }
+                                    Err(e) => self.fn_status_msg = format!("✖ {}", e),
+                                }
+                            }
+                        }
+                    });
+
+                    if !self.fn_status_msg.is_empty() {
+                        ui.label(egui::RichText::new(&self.fn_status_msg).font(egui::FontId::proportional(11.0)).color(egui::Color32::from_rgb(0, 235, 160)));
+                    }
+                }
+            });
         });
     }
 
@@ -2437,9 +2589,9 @@ impl AppState {
 
                         ui.checkbox(&mut self.tweak_opts.tweak_nagle, egui::RichText::new("Disable Nagle (TcpAckFrequency=1, TCPNoDelay=1, DelAck=0)").strong());
                         ui.checkbox(&mut self.tweak_opts.tweak_tcp_stack, egui::RichText::new("Deep TCP Stack: RSC=Off, PacketCoalescing=Off, Ack=10ms/1, BBR2/CTCP").strong());
-                        ui.checkbox(&mut self.tweak_opts.tweak_afd_mtu, egui::RichText::new("Winsock AFD Fast-Path + Fix MTU=1500 (Jumbo Off, P2P Off)").strong());
+                        ui.checkbox(&mut self.tweak_opts.tweak_afd_mtu, egui::RichText::new("Winsock AFD + IPv4 First + Fix MTU=1500 (Jumbo Off)").strong());
                         ui.checkbox(&mut self.tweak_opts.tweak_throttling, egui::RichText::new("NetworkThrottlingIndex=0xffffffff & MMCSS Games High").strong());
-                        ui.checkbox(&mut self.tweak_opts.tweak_qos, egui::RichText::new("QoS DSCP 46 (EF) + Remove 20% Bandwidth Limit").strong());
+                        ui.checkbox(&mut self.tweak_opts.tweak_qos, egui::RichText::new("QoS DSCP 46 (EF) for Game + Fortnite UDP 9000-9200 / 22222").strong());
                         ui.checkbox(&mut self.tweak_opts.tweak_nic_metric, egui::RichText::new("Physical Metric=5 (AutoMetric=Off) vs VPN Metric=500").strong());
                         ui.checkbox(&mut self.tweak_opts.tweak_nic_hardware, egui::RichText::new("NIC Driver: InterruptMod=Off, GigaLite=Off, EEE=Off, RSS=On").strong());
                     });
@@ -2567,9 +2719,10 @@ impl AppState {
                 Language::Russian => "Быстрый выбор цели:",
             };
             ui.label(pre_lbl);
+            if ui.button("Fortnite DE (18.157.3.179)").clicked() { self.diag_host = "18.157.3.179".into(); }
+            if ui.button("AWS Frankfurt").clicked() { self.diag_host = "dynamodb.eu-central-1.amazonaws.com".into(); }
+            if ui.button("AWS Edge (13.248.158.1)").clicked() { self.diag_host = "13.248.158.1".into(); }
             if ui.button("Valve Warsaw").clicked() { self.diag_host = "155.133.230.1".into(); }
-            if ui.button("Valve Frankfurt").clicked() { self.diag_host = "155.133.226.1".into(); }
-            if ui.button("Fortnite AWS EU").clicked() { self.diag_host = "dynamodb.eu-central-1.amazonaws.com".into(); }
             if ui.button("Cloudflare 1.1.1.1").clicked() { self.diag_host = "1.1.1.1".into(); }
         });
 
@@ -2702,7 +2855,7 @@ fn main() -> eframe::Result<()> {
                 .ok();
 
             if let Some(tray_item) = &mut tray {
-                let _ = tray_item.add_label("⚡ WPing v2.1 • Created by Vsqy");
+                let _ = tray_item.add_label("⚡ WPing v2.2 • Created by Vsqy");
                 let _ = tray_item.add_label("───────────────");
 
                 let show_txt = match lang {
